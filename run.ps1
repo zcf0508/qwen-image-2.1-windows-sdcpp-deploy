@@ -6,7 +6,7 @@
 
     示例：
       .\run.ps1 -Prompt "一只橘猫在溪水边喝水" -Width 768 -Height 768
-      .\run.ps1 -InitImage .\outputs\cat-water-768.png -PromptFile .\prompts\edit-cat-to-dog.txt
+      .\run.ps1 -InitImage .\outputs\cat-water-768.png -PromptFile .\my-prompt.txt
 #>
 param(
     [string]$Prompt         = '一只可爱的猫在水边玩耍',

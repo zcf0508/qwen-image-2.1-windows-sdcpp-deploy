@@ -562,7 +562,8 @@ class App(tk.Tk):
         ttk.Radiobutton(mode_row, text="图像编辑", value="edit", variable=self.var_mode,
                         command=self.on_mode).pack(side="left", padx=(18, 0))
 
-        self.ref_path = None
+        # 参考图是有序列表，顺序即提示词里的「图一 / 图二」
+        self.ref_paths = []
         ref_row = ttk.Frame(input_box)
         ref_row.pack(fill="x", pady=(PAD, 0))
         self.btn_ref = ttk.Button(ref_row, text="选择参考图…", command=self.on_pick_ref)
@@ -570,6 +571,23 @@ class App(tk.Tk):
         ttk.Button(ref_row, text="清除", command=self.on_clear_ref).pack(side="left", padx=(8, 0))
         self.var_ref = tk.StringVar(value="未选择")
         ttk.Label(ref_row, textvariable=self.var_ref, style="Muted.TLabel").pack(side="left", padx=(10, 0))
+
+        list_row = ttk.Frame(input_box)
+        list_row.pack(fill="x", pady=(6, 0))
+        self.list_ref = tk.Listbox(
+            list_row, height=3, activestyle="none", font=(UI_FONT, 9),
+            relief="solid", borderwidth=1, highlightthickness=0,
+            background=PANEL, foreground=TEXT, selectbackground=ACCENT_SOFT,
+            selectforeground=TEXT, exportselection=False)
+        self.list_ref.pack(side="left", fill="x", expand=True)
+        ref_btns = ttk.Frame(list_row)
+        ref_btns.pack(side="left", padx=(6, 0))
+        ttk.Button(ref_btns, text="↑", width=3,
+                   command=lambda: self.on_move_ref(-1)).pack()
+        ttk.Button(ref_btns, text="↓", width=3,
+                   command=lambda: self.on_move_ref(1)).pack(pady=(4, 0))
+        ttk.Button(ref_btns, text="移除", width=6,
+                   command=self.on_remove_ref).pack(pady=(4, 0))
 
         self.txt_prompt = tk.Text(input_box, height=4, width=44, wrap="word", font=(UI_FONT, 10),
                                   relief="solid", borderwidth=1, highlightthickness=0,
@@ -770,21 +788,63 @@ class App(tk.Tk):
         if editing and self.server.running() and not self.server.with_vision:
             self.log("提示：当前服务未加载视觉塔，编辑模式需要重启服务。")
 
+    def _refresh_ref_list(self):
+        """按当前顺序重画参考图列表，行首序号即提示词里的图一、图二"""
+        self.list_ref.delete(0, "end")
+        for index, path in enumerate(self.ref_paths, start=1):
+            self.list_ref.insert("end", f"{index}. {path.name}")
+        if self.ref_paths:
+            self.var_ref.set(f"已选 {len(self.ref_paths)} 张")
+        else:
+            self.var_ref.set("未选择")
+
     def on_pick_ref(self):
-        path = filedialog.askopenfilename(
-            title="选择参考图",
+        paths = filedialog.askopenfilenames(
+            title="选择参考图（可多选，按住 Ctrl 或 Shift）",
             initialdir=str(OUTPUTS if OUTPUTS.is_dir() else ROOT),
             filetypes=[("图片", "*.png *.jpg *.jpeg *.webp *.bmp"), ("所有文件", "*.*")],
         )
-        if not path:
+        if not paths:
             return
-        self.ref_path = Path(path)
-        self.var_ref.set(self.ref_path.name)
-        self.var_mode.set("edit")
+        added = 0
+        for raw in paths:
+            candidate = Path(raw)
+            if candidate in self.ref_paths:
+                continue
+            self.ref_paths.append(candidate)
+            added += 1
+        if added:
+            self._refresh_ref_list()
+            self.var_mode.set("edit")
 
     def on_clear_ref(self):
-        self.ref_path = None
-        self.var_ref.set("未选择")
+        self.ref_paths = []
+        self._refresh_ref_list()
+
+    def on_move_ref(self, delta):
+        """移动选中的参考图，用来调整它与提示词的对应关系"""
+        selection = self.list_ref.curselection()
+        if not selection:
+            self.log("先在列表里点一张参考图，再调顺序。")
+            return
+        index = selection[0]
+        target = index + delta
+        if not 0 <= target < len(self.ref_paths):
+            return
+        self.ref_paths[index], self.ref_paths[target] = self.ref_paths[target], self.ref_paths[index]
+        self._refresh_ref_list()
+        self.list_ref.selection_set(target)
+
+    def on_remove_ref(self):
+        selection = self.list_ref.curselection()
+        if not selection:
+            self.log("先在列表里点一张参考图，再移除。")
+            return
+        index = selection[0]
+        del self.ref_paths[index]
+        self._refresh_ref_list()
+        if index < len(self.ref_paths):
+            self.list_ref.selection_set(index)
 
     def on_start(self):
         if self.server.running():
@@ -849,8 +909,8 @@ class App(tk.Tk):
             return
 
         editing = self.var_mode.get() == "edit"
-        if editing and self.ref_path is None:
-            messagebox.showwarning("提示", "图像编辑模式需要先选择参考图。")
+        if editing and not self.ref_paths:
+            messagebox.showwarning("提示", "图像编辑模式需要先选择至少一张参考图。")
             return
 
         try:
@@ -920,8 +980,16 @@ class App(tk.Tk):
                 "vae_tiling_params": {"enabled": True},
             }
             if editing:
-                data = base64.b64encode(self.ref_path.read_bytes()).decode("ascii")
-                payload["ref_images"] = [f"data:image/png;base64,{data}"]
+                # 顺序即提示词里的图一、图二：服务端按数组顺序逐张编码，
+                # increase_ref_index 让每张参考图拿到递增的位置索引，模型据此区分它们
+                images = []
+                for path in self.ref_paths:
+                    data = base64.b64encode(path.read_bytes()).decode("ascii")
+                    images.append(f"data:image/png;base64,{data}")
+                payload["ref_images"] = images
+                payload["increase_ref_index"] = True
+                self.emit("log", "参考图顺序：" + "，".join(
+                    f"图{i} {p.name}" for i, p in enumerate(self.ref_paths, start=1)))
 
             job_id = self.server.submit(payload)
             if not job_id:
