@@ -1,1 +1,20 @@
-__pycache__
+# 本项目不入库的内容都是「体积巨大、可由脚本重新获取」的东西。
+# 除 __pycache__ 外，其余目录里的文件全部由 setup.ps1 下载，不入库。
+
+__pycache__/
+*.pyc
+
+# 推理程序与 CUDA 运行库（sd.cpp 发行包 + cudart，约 1.1 GB）
+bin/
+
+# 模型权重（约 12 GB，其中 HQv3 已修正版托管在 HuggingFace 上）
+models/
+
+# 安装包缓存（约 0.9 GB，保留可省去重新下载）
+downloads/
+
+# 生成结果
+outputs/
+
+# 模型文件头的备份，只在打补丁时需要
+*.header.bak
