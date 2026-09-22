@@ -1,34 +1,47 @@
 # Qwen-Image-2.1 本地部署
 
-在 RTX 4070 12GB 上本地跑 Qwen-Image-2.1，支持文生图与图像编辑，基于 stable-diffusion.cpp，不依赖 ComfyUI。
+在 12GB 显存以上的 NVIDIA 显卡上本地跑 Qwen-Image-2.1，支持文生图与图像编辑，基于 stable-diffusion.cpp，不依赖 ComfyUI。
 
-工具链：`sd-server.exe` / `sd-cli.exe` 提供推理后端，外加一个图形界面和两个命令行入口。
+工具链：`sd-server.exe` / `sd-cli.exe` 提供推理后端，外加一个图形界面和两个命令行入口。模型权重共约 12 GB，全部由安装脚本下载并逐一校验 SHA256。
 
 ## 快速开始
 
+三步，全程约半小时，大头是下载。
+
 ```powershell
-cd E:\zcf0508\qwen-image-2_1
+# 1. 准备环境并下载依赖，首次约 13 GB
+.\setup.ps1
+
+# 2. 启动图形界面
 uv run --no-project gui.py
+
+# 3. 界面上点「启动服务」→ 填提示词 → 点「生成」
 ```
 
-打开界面后点「启动服务」→ 填提示词 → 点「生成」。
+需要代理时加参数，脚本会把它同时用于所有下载：
+
+```powershell
+.\setup.ps1 -Proxy http://127.0.0.1:7890
+```
+
+安装脚本可重复执行：已下载且校验通过的文件会跳过，下载中断后重跑即可续传。想同时备一份速度更快的普通量化，加 `-WithFallback`。
 
 ## 目录结构
 
 ```
-E:\zcf0508\qwen-image-2_1\
+<仓库根目录>\
+├── setup.ps1                       安装脚本：环境检查、依赖下载校验、解压落位、设备自检
 ├── gui.py                          图形界面（uv run，推荐入口）
 ├── launcher.py                     命令行启动器（uv run）
 ├── run.ps1                         PowerShell 生成脚本
-├── patch_gguf_img_in.py            修正 HQv3 模型的形状声明（重新下载模型后需重跑）
-├── bin\                            sd-cli.exe / sd-server.exe + CUDA 运行库
-├── models\
+├── patch_gguf_img_in.py            维护用：修正 ComfyUI-GGUF 导出模型的形状声明
+├── bin\                            sd-cli.exe / sd-server.exe + CUDA 运行库（由 setup.ps1 下载）
+├── models\                         权重（由 setup.ps1 下载，共约 12 GB）
 │   ├── Qwen-Image-2.1-Q4_K_M-HQv3.gguf                 扩散模型（在用）5960 MB → 显存
-│   ├── qwen-image-2.1-Q4_K_M.gguf                     扩散模型（备选）4605 MB → 显存
+│   ├── qwen-image-2.1-Q4_K_M.gguf                     扩散模型（备选，需 -WithFallback）4605 MB → 显存
 │   ├── text_encoders\
 │   │   ├── Qwen3VL-8B-Instruct-Q4_K_M.gguf            文本编码器 4795 MB → 内存
-│   │   ├── mmproj-Qwen3VL-8B-Instruct-F16.gguf        视觉塔    1105 MB → 内存（仅编辑）
-│   │   └── qwen3vl_8b_int8_convrot.safetensors        未使用，可删 8918 MB
+│   │   └── mmproj-Qwen3VL-8B-Instruct-F16.gguf        视觉塔    1105 MB → 内存（仅编辑）
 │   └── vae\qwen_image_2.1_vae_bf16.safetensors        VAE        644 MB → 显存
 ├── prompts\                        示例提示词
 ├── outputs\                        生成结果
@@ -159,7 +172,7 @@ uv run --no-project gui.py
 ### launcher.py
 
 ```powershell
-cd E:\zcf0508\qwen-image-2_1
+cd <仓库根目录>
 
 # 交互式向导：选模式 → 写提示词 → 选参考图 → 设参数
 uv run --no-project launcher.py
@@ -189,7 +202,7 @@ uv run --no-project launcher.py -i outputs\cat-water-768.png -p "把猫换成小
 不依赖 Python，直接调用 `sd-cli`，每次运行都会重新加载模型。
 
 ```powershell
-cd E:\zcf0508\qwen-image-2_1
+cd <仓库根目录>
 .\run.ps1 -Prompt "一只橘猫在溪水边喝水" -Width 768 -Height 768 -Steps 20
 
 # 图像编辑
@@ -233,16 +246,19 @@ total params memory size = 10629.76MB (VRAM 6327.42MB, RAM 4302.33MB):
 
 ## 环境要求
 
-- Windows + NVIDIA 显卡（本机 RTX 4070 12GB，驱动 610.47）
-- 系统内存 32GB（本机实测：模型常驻时约占 4.3–5.4 GB，加上日常桌面程序约 20 GB 基线）
-- `gui.py` 与 `launcher.py` 需要 uv；`run.ps1` 不需要。本机 uv 0.12.13，Python 由 uv 管理
+- **仅支持 Windows**，需要 NVIDIA 显卡。显存 12 GB 起（开发与测试平台为 RTX 4070 12GB，驱动 610.47）；显存不足时安装脚本会提示，小尺寸仍可能跑，但高清档必然失败
+- 系统内存 32 GB。权重常驻时文本编码器约占 4.3 GB，加上日常桌面程序约 20 GB 基线
+- 磁盘可用空间 25 GB 以上（权重 12 GB、推理程序与运行库 1.1 GB、安装包缓存 0.9 GB）
+- 需要 [uv](https://docs.astral.sh/uv/)。安装脚本会检查，缺失时给出安装命令；Python 由 uv 管理，无需自己安装
+- 首次需下载约 13 GB。国内网络通常需要代理，用 `.\setup.ps1 -Proxy http://127.0.0.1:7890`
 
 ## 组件来源
 
 | 组件 | 来源 |
 | --- | --- |
 | 扩散模型 GGUF（普通 Q4_K_M，备选） | https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF |
-| 扩散模型 GGUF（Q4_K_M-HQv3，在用） | https://huggingface.co/realrebelai/Qwen-Image-2.1_GGUFs |
+| 扩散模型 GGUF（Q4_K_M-HQv3，在用） | https://huggingface.co/zcf0508/qwen-image-2.1-hqv3-sdcpp-fixed （已修正 sd.cpp 兼容性） |
+| 扩散模型量化原始出处 | https://huggingface.co/realrebelai/Qwen-Image-2.1_GGUFs |
 | 文本编码器 / 视觉塔 GGUF | https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF |
 | VAE | https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF |
 | 推理程序 | https://github.com/leejet/stable-diffusion.cpp |
@@ -260,6 +276,13 @@ total params memory size = 10629.76MB (VRAM 6327.42MB, RAM 4302.33MB):
 
 **编辑模式 VAE 解码可能触发显存不足。** 实测出现过 `model manager cannot make enough memory available on CUDA0`，程序自动降级为空间分块解码（spatial tiling）并正常出图，属预期行为，日志中的重试提示不必处理。
 
+## 许可与致谢
+
+- 上游基座模型 [Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) 适用 **Qwen Research License**：默认供研究与评估使用，商用需另行取得授权。本仓库的脚本与文档不改变该许可，下载并使用模型即表示你接受其条款。
+- 量化权重出自 realrebelai 的 [Qwen-Image-2.1_GGUFs](https://huggingface.co/realrebelai/Qwen-Image-2.1_GGUFs)（HQv3 混合精度方案）。本仓使用的 HQv3 文件只修正了一处元数据，使 stable-diffusion.cpp 能正确推断网络规模，量化本身未做任何改动；修正过程与原理见 [修正仓库](https://huggingface.co/zcf0508/qwen-image-2.1-hqv3-sdcpp-fixed)。
+- 推理后端为 [leejet/stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)，版本钉死在 `master-889-c678dfe`。
+- 本仓库的脚本与文档（`setup.ps1`、`gui.py`、`launcher.py`、`run.ps1`、`patch_gguf_img_in.py`）可自由使用与修改。
+
 ## 维护
 
 **降低显存压力的备选手段**，依次尝试：把尺寸降到 512、步数降到 12、追加 `--vae-tiling`，或改用 `--params-backend diffusion=disk` 让扩散模型按需从磁盘加载权重。
@@ -271,4 +294,4 @@ total params memory size = 10629.76MB (VRAM 6327.42MB, RAM 4302.33MB):
 | `models\text_encoders\qwen3vl_8b_int8_convrot.safetensors` | 8.9 GB | 未使用的备选编码器 |
 | `downloads\` | 约 1.3 GB | 安装包与解压暂存 |
 
-`downloads\sd-win-cuda12.zip` 与 `downloads\cudart-sd-bin-win-cu12-x64.zip` 建议保留，重装时可省去重新下载。
+`downloads\` 下的两个压缩包建议保留，重装时可省去重新下载。它们由 `setup.ps1` 按上游资产名保存，文件名与 GitHub 发布页一致，所以对照文件名就能看出用的是哪个版本。
