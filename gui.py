@@ -14,16 +14,17 @@
 import base64
 import ctypes
 import json
+import math
+import os
 import queue
 import subprocess
 import sys
 import threading
 import time
+import tkinter as tk
 import urllib.error
 import urllib.request
 from pathlib import Path
-
-import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 ROOT = Path(__file__).resolve().parent
@@ -318,14 +319,22 @@ class QwenServer:
 BG = "#F4F1EE"
 PANEL = "#FFFFFF"
 BORDER = "#E2DCD7"
+FIELD_BG = "#FFFEFC"
+FIELD_BORDER = "#C8BFB7"
+CONTROL_BG = "#E5DFD9"
+CONTROL_HOVER = "#D8CFC7"
+CONTROL_ACTIVE = "#CCC1B8"
+DISABLED_BG = "#EEEAE6"
+DISABLED_TEXT = "#9B9189"
 TEXT = "#1F1B18"
-MUTED = "#7A716B"
+MUTED = "#665D57"
 ACCENT = "#A8520A"
 ACCENT_ACTIVE = "#8F4508"
 ACCENT_SOFT = "#FBEEE1"
+ACCENT_TINT = "#F1D4BC"
 LOG_BG = "#1C1917"
 LOG_FG = "#D8D2CB"
-STATE_COLORS = {"idle": MUTED, "busy": "#B45309", "ready": "#15803D", "error": "#B91C1C"}
+STATE_COLORS = {"idle": "#8B5E3C", "busy": "#B45309", "ready": "#15803D", "error": "#B91C1C"}
 
 UI_FONT = "Microsoft YaHei UI"
 MONO_FONT = "Consolas"
@@ -362,18 +371,60 @@ SIZE_PRESETS_HD = (
 SECONDS_PER_MP = 95
 
 
+def parse_generation_parameters(width_text, height_text, steps_text, cfg_text, seed_text):
+    """解析并校验生成参数，返回 ((宽, 高, 步数, 引导, 种子), 错误信息)。"""
+    try:
+        values = (
+            int(width_text), int(height_text), int(steps_text),
+            float(cfg_text), int(seed_text),
+        )
+    except ValueError:
+        return None, "宽、高、步数、引导和种子都必须是数字"
+
+    width, height, steps, cfg, _seed = values
+    if width <= 0 or height <= 0:
+        return None, "宽和高必须大于 0"
+    if width % 128 or height % 128:
+        return None, "宽和高必须是 128 的倍数，避免分块接缝"
+    if steps <= 0:
+        return None, "步数必须大于 0"
+    if not math.isfinite(cfg) or cfg < 0:
+        return None, "引导强度必须是大于等于 0 的有限数字"
+    return values, None
+
+
 class SizePresetStrip(tk.Canvas):
     """宽高比预设条：每格画出该比例的缩略矩形，点一下切换尺寸"""
 
     THUMB_BOX = 30
 
     def __init__(self, master, presets, on_click, **kwargs):
-        super().__init__(master, height=72, highlightthickness=0, background=BG, **kwargs)
+        super().__init__(master, height=72, highlightthickness=1,
+                         highlightbackground=BG, highlightcolor=ACCENT,
+                         background=BG, takefocus=1, **kwargs)
         self.presets = presets
         self.on_click = on_click
         self.selected = None
         self.bind("<Configure>", lambda _event: self.redraw())
+        self.bind("<Left>", lambda _event: self._move_selection(-1))
+        self.bind("<Right>", lambda _event: self._move_selection(1))
+        self.bind("<Home>", lambda _event: self._choose(0))
+        self.bind("<End>", lambda _event: self._choose(len(self.presets) - 1))
+        self.bind("<Return>", lambda _event: self._activate_selected())
+        self.bind("<space>", lambda _event: self._activate_selected())
         self.redraw()
+
+    def _choose(self, index):
+        self.focus_set()
+        self.on_click(*self.presets[index][1:])
+        return "break"
+
+    def _move_selection(self, delta):
+        index = self.selected if self.selected is not None else 0
+        return self._choose(max(0, min(len(self.presets) - 1, index + delta)))
+
+    def _activate_selected(self):
+        return self._choose(self.selected if self.selected is not None else 0)
 
     def set_selected(self, index):
         """只刷新高亮，不触发回调"""
@@ -412,7 +463,7 @@ class SizePresetStrip(tk.Canvas):
                              fill=ACCENT if active else MUTED,
                              font=(UI_FONT, 8), tags=tag)
 
-            self.tag_bind(tag, "<Button-1>", lambda _event, i=index: self.on_click(*self.presets[i][1:]))
+            self.tag_bind(tag, "<Button-1>", lambda _event, i=index: self._choose(i))
             self.tag_bind(tag, "<Enter>", lambda _event: self.configure(cursor="hand2"))
             self.tag_bind(tag, "<Leave>", lambda _event: self.configure(cursor=""))
 
@@ -423,22 +474,35 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Qwen-Image-2.1")
-        self.geometry("1320x940")
-        self.minsize(1120, 780)
+        width = min(1280, self.winfo_screenwidth() - 80)
+        height = min(800, self.winfo_screenheight() - 80)
+        x = max(0, (self.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.winfo_screenheight() - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.minsize(1040, 680)
         self._setup_style()
 
         self.events = queue.Queue()
         self.server = QwenServer(self.emit)
         self.busy = False
+        self.cancel_pending = False
+        self.force_stopping = False
+        self.service_starting = False
         self.preview = None
+        self.preview_source = None
+        self.preview_resize_job = None
         self.result_path = None
         self.start_time = 0.0
+        self._params_valid = True
+        self.log_visible = False
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.bind("<Control-Return>", self._shortcut_generate)
         self.after(100, self._drain)
+        self.after_idle(self.txt_prompt.focus_set)
         threading.Thread(target=self._monitor_loop, daemon=True).start()
-        self.log("就绪。点击「启动服务」加载模型（约 10 秒），或直接点「生成」自动启动。")
+        self.log("就绪。填写画面描述后按 Ctrl+Enter；服务未启动时会自动加载。")
 
     # ------------------------------------------------------------ 样式与布局
 
@@ -452,55 +516,157 @@ class App(tk.Tk):
                         bordercolor=BORDER, focuscolor=ACCENT)
         style.configure("TFrame", background=BG)
         style.configure("TLabelframe", background=BG, bordercolor=BORDER,
-                        relief="solid", borderwidth=1)
-        style.configure("TLabelframe.Label", background=BG, foreground=MUTED)
+                        lightcolor=BORDER, darkcolor=BORDER,
+                        relief="flat", borderwidth=1)
+        style.configure("TLabelframe.Label", background=BG, foreground=MUTED,
+                        font=(UI_FONT, 9, "bold"))
         style.configure("TLabel", background=BG, foreground=TEXT)
         style.configure("Muted.TLabel", background=BG, foreground=MUTED)
+        style.configure("Title.TLabel", background=BG, foreground=TEXT,
+                        font=(UI_FONT, 15, "bold"))
+        style.configure("Section.TLabel", background=BG, foreground=TEXT,
+                        font=(UI_FONT, 10, "bold"))
+        style.configure("Error.TLabel", background=BG, foreground=STATE_COLORS["error"])
         style.configure("Metric.TLabel", background=BG, foreground=MUTED, font=(MONO_FONT, 10))
         style.configure("State.TLabel", background=BG, foreground=MUTED, font=(UI_FONT, 10, "bold"))
-        style.configure("TCheckbutton", background=BG, foreground=TEXT)
-        style.map("TCheckbutton", background=[("active", BG)])
-        style.configure("TRadiobutton", background=BG, foreground=TEXT)
-        style.map("TRadiobutton", background=[("active", BG)])
+        style.configure("TPanedwindow", background=BG, sashrelief="flat", sashwidth=6)
 
-        base_button = dict(bordercolor=BORDER, relief="solid", borderwidth=1,
-                           padding=(12, 7), font=(UI_FONT, 10))
-        style.configure("TButton", background=PANEL, foreground=TEXT, **base_button)
+        base_button = dict(
+            borderwidth=0, relief="flat", padding=(13, 8), font=(UI_FONT, 10),
+            focusthickness=1, focuscolor=ACCENT,
+        )
+        style.configure(
+            "TButton", background=CONTROL_BG, foreground=TEXT,
+            bordercolor=CONTROL_BG, lightcolor=CONTROL_BG, darkcolor=CONTROL_BG,
+            **base_button,
+        )
         style.map("TButton",
-                  background=[("active", ACCENT_SOFT), ("disabled", BG)],
-                  foreground=[("disabled", MUTED)])
-        # 同一行里的主次按钮几何完全一致，只靠填充与描边区分
-        style.configure("Primary.TButton", background=ACCENT, foreground="#FFFFFF",
-                        bordercolor=ACCENT, relief="solid", borderwidth=1,
-                        padding=(12, 7), font=(UI_FONT, 10))
+                  background=[("disabled", DISABLED_BG), ("pressed", CONTROL_ACTIVE),
+                              ("active", CONTROL_HOVER)],
+                  bordercolor=[("disabled", DISABLED_BG), ("pressed", CONTROL_ACTIVE),
+                               ("active", CONTROL_HOVER)],
+                  lightcolor=[("disabled", DISABLED_BG), ("pressed", CONTROL_ACTIVE),
+                              ("active", CONTROL_HOVER)],
+                  darkcolor=[("disabled", DISABLED_BG), ("pressed", CONTROL_ACTIVE),
+                             ("active", CONTROL_HOVER)],
+                  foreground=[("disabled", DISABLED_TEXT)],
+                  relief=[("pressed", "flat")])
+        style.configure("Compact.TButton", padding=(10, 6), font=(UI_FONT, 9))
+        style.configure(
+            "Primary.TButton", background=ACCENT, foreground="#FFFFFF",
+            bordercolor=ACCENT, lightcolor=ACCENT, darkcolor=ACCENT,
+            **base_button,
+        )
         style.map("Primary.TButton",
-                  background=[("active", ACCENT_ACTIVE), ("disabled", "#DCC7B2")],
-                  foreground=[("disabled", "#FFF9F4")])
-        style.configure("Secondary.TButton", background=PANEL, foreground=TEXT, **base_button)
+                  background=[("disabled", "#DCC7B2"), ("pressed", ACCENT_ACTIVE),
+                              ("active", ACCENT_ACTIVE)],
+                  bordercolor=[("disabled", "#DCC7B2"), ("pressed", ACCENT_ACTIVE),
+                               ("active", ACCENT_ACTIVE)],
+                  lightcolor=[("disabled", "#DCC7B2"), ("pressed", ACCENT_ACTIVE),
+                              ("active", ACCENT_ACTIVE)],
+                  darkcolor=[("disabled", "#DCC7B2"), ("pressed", ACCENT_ACTIVE),
+                             ("active", ACCENT_ACTIVE)],
+                  foreground=[("disabled", "#FFF9F4")],
+                  relief=[("pressed", "flat")])
+        style.configure(
+            "Secondary.TButton", background=CONTROL_BG, foreground=TEXT,
+            bordercolor=CONTROL_BG, lightcolor=CONTROL_BG, darkcolor=CONTROL_BG,
+            **base_button,
+        )
         style.map("Secondary.TButton",
-                  background=[("active", ACCENT_SOFT), ("disabled", BG)],
-                  foreground=[("disabled", MUTED)])
-        style.configure("TScrollbar", background=BG, troughcolor=BG, bordercolor=BORDER)
+                  background=[("disabled", DISABLED_BG), ("pressed", CONTROL_ACTIVE),
+                              ("active", CONTROL_HOVER)],
+                  bordercolor=[("disabled", DISABLED_BG), ("pressed", CONTROL_ACTIVE),
+                               ("active", CONTROL_HOVER)],
+                  foreground=[("disabled", DISABLED_TEXT)],
+                  relief=[("pressed", "flat")])
+        style.configure(
+            "TScrollbar", background=CONTROL_BG, troughcolor=BG,
+            bordercolor=BG, lightcolor=CONTROL_BG, darkcolor=CONTROL_BG,
+            relief="flat", borderwidth=0, arrowsize=12,
+        )
+        style.map("TScrollbar", background=[("active", CONTROL_HOVER),
+                                             ("pressed", CONTROL_ACTIVE)])
+        style.configure("Accent.Horizontal.TProgressbar", troughcolor=BORDER,
+                        background=ACCENT, bordercolor=BG, lightcolor=ACCENT,
+                        darkcolor=ACCENT, relief="flat", borderwidth=0)
 
     def _build(self):
         self.configure(background=BG)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
-        # 顶部状态栏：状态语义交给颜色，读数用等宽字体
+        flat_field = {
+            "background": FIELD_BG,
+            "foreground": TEXT,
+            "selectbackground": ACCENT_SOFT,
+            "selectforeground": TEXT,
+            "relief": "flat",
+            "borderwidth": 0,
+            "highlightthickness": 1,
+            "highlightbackground": FIELD_BORDER,
+            "highlightcolor": ACCENT,
+        }
+        flat_toggle = {
+            "indicatoron": False,
+            "font": (UI_FONT, 9),
+            "background": CONTROL_BG,
+            "foreground": TEXT,
+            "selectcolor": ACCENT_TINT,
+            "activebackground": CONTROL_HOVER,
+            "activeforeground": TEXT,
+            "disabledforeground": MUTED,
+            "relief": "flat",
+            "offrelief": "flat",
+            "overrelief": "flat",
+            "borderwidth": 0,
+            "highlightthickness": 0,
+            "padx": 10,
+            "pady": 5,
+        }
+
+        def flat_entry(master, variable, font, justify="left"):
+            shell = tk.Frame(
+                master, background=FIELD_BG, relief="flat", borderwidth=0,
+                highlightthickness=1, highlightbackground=FIELD_BORDER,
+            )
+            entry = tk.Entry(
+                shell, textvariable=variable, font=font, justify=justify,
+                background=FIELD_BG, foreground=TEXT, insertbackground=TEXT,
+                selectbackground=ACCENT_SOFT, selectforeground=TEXT,
+                relief="flat", borderwidth=0, highlightthickness=0,
+            )
+            entry.pack(fill="both", expand=True, padx=7, pady=4)
+            entry.bind("<FocusIn>", lambda _event: shell.configure(
+                highlightbackground=ACCENT))
+            entry.bind("<FocusOut>", lambda _event: shell.configure(
+                highlightbackground=FIELD_BORDER))
+            return shell
+
+        # 顶部工作区：产品、服务状态、资源读数与服务控制保持在同一工具栏。
         status = ttk.Frame(self, padding=(PAD + 4, PAD))
         status.grid(row=0, column=0, sticky="ew")
+        status.columnconfigure(0, weight=1)
         self.var_state = tk.StringVar(value="● 服务未启动")
         self.var_vram = tk.StringVar(value="显存 —")
         self.var_ram = tk.StringVar(value="内存 —")
-        self.lbl_state = ttk.Label(status, textvariable=self.var_state, style="State.TLabel")
+        brand = ttk.Frame(status)
+        brand.grid(row=0, column=0, sticky="w")
+        ttk.Label(brand, text="Qwen Image", style="Title.TLabel").pack(side="left")
+        ttk.Label(brand, text="本地创作台", style="Muted.TLabel").pack(
+            side="left", padx=(10, 18))
+        self.lbl_state = ttk.Label(brand, textvariable=self.var_state, style="State.TLabel")
         self.lbl_state.pack(side="left")
-        ttk.Label(status, textvariable=self.var_ram, style="Metric.TLabel").pack(side="right")
-        ttk.Label(status, textvariable=self.var_vram, style="Metric.TLabel").pack(
-            side="right", padx=(0, 18))
+
+        metrics = ttk.Frame(status)
+        metrics.grid(row=0, column=1, padx=(12, 16))
+        ttk.Label(metrics, textvariable=self.var_vram, style="Metric.TLabel").pack(side="left")
+        ttk.Label(metrics, textvariable=self.var_ram, style="Metric.TLabel").pack(
+            side="left", padx=(14, 0))
 
         body = ttk.Panedwindow(self, orient="horizontal")
-        body.grid(row=1, column=0, sticky="nsew", padx=PAD + 4)
+        body.grid(row=1, column=0, sticky="nsew", padx=PAD + 4,
+                  pady=(0, PAD + 4))
 
         # 左侧控制面板：放进可滚动容器，窗口再矮也不会把按钮挤没
         left_outer = ttk.Frame(body, padding=(0, 0, PAD, 0))
@@ -509,10 +675,10 @@ class App(tk.Tk):
         left_outer.columnconfigure(0, weight=1)
 
         left_canvas = tk.Canvas(left_outer, highlightthickness=0, background=BG,
-                                width=392, height=600, takefocus=0)
-        left_canvas.grid(row=0, column=0, sticky="nsew")
+                                width=356, height=560, takefocus=0)
+        left_canvas.grid(row=0, column=0, sticky="nsew", pady=(0, 48))
         left_scroll = ttk.Scrollbar(left_outer, orient="vertical", command=left_canvas.yview)
-        left_scroll.grid(row=0, column=1, sticky="ns")
+        left_scroll.grid(row=0, column=1, sticky="ns", pady=(0, 48))
         left_canvas.configure(yscrollcommand=left_scroll.set)
 
         left = ttk.Frame(left_canvas)
@@ -537,19 +703,19 @@ class App(tk.Tk):
         left_canvas.bind("<Enter>", lambda _e: left_canvas.bind_all("<MouseWheel>", _on_wheel))
         left_canvas.bind("<Leave>", lambda _e: left_canvas.unbind_all("<MouseWheel>"))
 
-        server_box = ttk.LabelFrame(left, text=" 服务 ", padding=PAD)
-        server_box.pack(fill="x", pady=(0, PAD))
-        server_row = ttk.Frame(server_box)
-        server_row.pack(fill="x")
-        self.btn_start = ttk.Button(server_row, text="启动服务", command=self.on_start)
-        self.btn_start.pack(side="left")
-        self.btn_stop = ttk.Button(server_row, text="停止服务", command=self.on_stop, state="disabled")
-        self.btn_stop.pack(side="left", padx=(8, 0))
-
-        self.var_vision = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            server_box, text="加载视觉塔（编辑需要，+1.1 GB 内存）", variable=self.var_vision
-        ).pack(anchor="w", pady=(PAD, 0))
+        service_toolbar = ttk.Frame(left)
+        service_toolbar.pack(fill="x", pady=(0, PAD))
+        ttk.Label(service_toolbar, text="推理服务", style="Muted.TLabel").pack(side="left")
+        self.btn_stop = ttk.Button(
+            service_toolbar, text="停止", command=self.on_stop,
+            style="Compact.TButton", state="disabled",
+        )
+        self.btn_stop.pack(side="right")
+        self.btn_start = ttk.Button(
+            service_toolbar, text="启动服务", command=self.on_start,
+            style="Compact.TButton",
+        )
+        self.btn_start.pack(side="right", padx=(0, 6))
 
         input_box = ttk.LabelFrame(left, text=" 输入 ", padding=PAD)
         input_box.pack(fill="both", expand=True, pady=(0, PAD))
@@ -557,58 +723,86 @@ class App(tk.Tk):
         mode_row = ttk.Frame(input_box)
         mode_row.pack(fill="x")
         self.var_mode = tk.StringVar(value="txt2img")
-        ttk.Radiobutton(mode_row, text="文生图", value="txt2img", variable=self.var_mode,
-                        command=self.on_mode).pack(side="left")
-        ttk.Radiobutton(mode_row, text="图像编辑", value="edit", variable=self.var_mode,
-                        command=self.on_mode).pack(side="left", padx=(18, 0))
+        mode_options = (("文生图", "txt2img"), ("图像编辑", "edit"))
+        for index, (text, value) in enumerate(mode_options):
+            button = tk.Radiobutton(
+                mode_row, text=text, value=value, variable=self.var_mode,
+                command=self.on_mode, indicatoron=False, font=(UI_FONT, 10),
+                background=CONTROL_BG, foreground=TEXT, selectcolor=ACCENT_TINT,
+                activebackground=CONTROL_HOVER, activeforeground=TEXT,
+                relief="flat", offrelief="flat", overrelief="flat",
+                borderwidth=0, highlightthickness=0,
+                padx=16, pady=7,
+            )
+            button.pack(side="left", fill="x", expand=True,
+                        padx=((0 if index == 0 else 4), (4 if index == 0 else 0)))
+        self.var_mode_hint = tk.StringVar()
+        self.lbl_mode_hint = ttk.Label(
+            input_box, textvariable=self.var_mode_hint, style="Muted.TLabel", wraplength=360,
+        )
+        self.lbl_mode_hint.pack(fill="x", pady=(6, 0))
 
         # 参考图是有序列表，顺序即提示词里的「图一 / 图二」
         self.ref_paths = []
-        ref_row = ttk.Frame(input_box)
-        ref_row.pack(fill="x", pady=(PAD, 0))
+        self.ref_panel = ttk.Frame(input_box)
+        self.ref_panel.pack(fill="x", pady=(PAD, 0))
+        ref_row = ttk.Frame(self.ref_panel)
+        ref_row.pack(fill="x")
         self.btn_ref = ttk.Button(ref_row, text="选择参考图…", command=self.on_pick_ref)
         self.btn_ref.pack(side="left")
-        ttk.Button(ref_row, text="清除", command=self.on_clear_ref).pack(side="left", padx=(8, 0))
+        self.btn_clear_ref = ttk.Button(ref_row, text="全部清除", command=self.on_clear_ref)
+        self.btn_clear_ref.pack(side="left", padx=(8, 0))
         self.var_ref = tk.StringVar(value="未选择")
         ttk.Label(ref_row, textvariable=self.var_ref, style="Muted.TLabel").pack(side="left", padx=(10, 0))
 
-        list_row = ttk.Frame(input_box)
+        list_row = ttk.Frame(self.ref_panel)
         list_row.pack(fill="x", pady=(6, 0))
         self.list_ref = tk.Listbox(
             list_row, height=3, activestyle="none", font=(UI_FONT, 9),
-            relief="solid", borderwidth=1, highlightthickness=0,
-            background=PANEL, foreground=TEXT, selectbackground=ACCENT_SOFT,
-            selectforeground=TEXT, exportselection=False)
-        self.list_ref.pack(side="left", fill="x", expand=True)
-        ref_btns = ttk.Frame(list_row)
-        ref_btns.pack(side="left", padx=(6, 0))
-        ttk.Button(ref_btns, text="↑", width=3,
-                   command=lambda: self.on_move_ref(-1)).pack()
-        ttk.Button(ref_btns, text="↓", width=3,
-                   command=lambda: self.on_move_ref(1)).pack(pady=(4, 0))
-        ttk.Button(ref_btns, text="移除", width=6,
-                   command=self.on_remove_ref).pack(pady=(4, 0))
+            exportselection=False, **flat_field)
+        self.list_ref.pack(fill="x", expand=True)
+        ref_btns = ttk.Frame(self.ref_panel)
+        ref_btns.pack(fill="x", pady=(5, 0))
+        self.btn_ref_up = ttk.Button(ref_btns, text="上移", width=5,
+                                     command=lambda: self.on_move_ref(-1),
+                                     style="Compact.TButton")
+        self.btn_ref_up.pack(side="left")
+        self.btn_ref_down = ttk.Button(ref_btns, text="下移", width=5,
+                                       command=lambda: self.on_move_ref(1),
+                                       style="Compact.TButton")
+        self.btn_ref_down.pack(side="left", padx=(5, 0))
+        self.btn_ref_remove = ttk.Button(ref_btns, text="移除", width=6,
+                                         command=self.on_remove_ref,
+                                         style="Compact.TButton")
+        self.btn_ref_remove.pack(side="left", padx=(5, 0))
+        self.list_ref.bind("<<ListboxSelect>>", lambda _event: self._sync_ref_buttons())
+        self.list_ref.bind("<Delete>", lambda _event: self.on_remove_ref())
 
+        prompt_header = ttk.Frame(input_box)
+        prompt_header.pack(fill="x", pady=(PAD, 0))
+        ttk.Label(prompt_header, text="画面描述", style="Section.TLabel").pack(side="left")
+        self.var_prompt_count = tk.StringVar(value="0 字")
+        ttk.Label(prompt_header, textvariable=self.var_prompt_count, style="Muted.TLabel").pack(side="right")
         self.txt_prompt = tk.Text(input_box, height=4, width=44, wrap="word", font=(UI_FONT, 10),
-                                  relief="solid", borderwidth=1, highlightthickness=0,
-                                  background=PANEL, foreground=TEXT, insertbackground=TEXT,
-                                  padx=8, pady=6)
-        self.txt_prompt.pack(fill="both", expand=True, pady=(PAD, 0))
+                                  insertbackground=TEXT, padx=8, pady=6, undo=True,
+                                  **flat_field)
+        self.txt_prompt.pack(fill="both", expand=True, pady=(4, 0))
+        self.txt_prompt.bind("<<Modified>>", self._on_prompt_changed)
+        self.txt_prompt.bind("<Control-Return>", self._shortcut_generate, add="+")
 
         ttk.Label(input_box, text="负面提示词（可留空）", style="Muted.TLabel").pack(
             anchor="w", pady=(PAD, 4))
         self.var_negative = tk.StringVar()
-        tk.Entry(input_box, textvariable=self.var_negative, font=(UI_FONT, 10), width=44,
-                 relief="solid", borderwidth=1, highlightthickness=0,
-                 background=PANEL, foreground=TEXT, insertbackground=TEXT).pack(fill="x", ipady=4)
+        flat_entry(input_box, self.var_negative, (UI_FONT, 10)).pack(fill="x")
 
         # 尺寸预设：一格一个宽高比，点一下即换
         size_box = ttk.LabelFrame(left, text=" 尺寸预设 ", padding=PAD)
         size_box.pack(fill="x", pady=(0, PAD))
         self.var_hd = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        tk.Checkbutton(
             size_box, text="高清档（边长 1.5 倍，单张大 2~4 分钟）",
-            variable=self.var_hd, command=self.on_toggle_tier,
+            variable=self.var_hd, command=self.on_toggle_tier, anchor="w",
+            **flat_toggle,
         ).pack(anchor="w", pady=(0, 6))
         self.strip = SizePresetStrip(size_box, SIZE_PRESETS, self.on_preset)
         self.strip.pack(fill="x")
@@ -639,21 +833,23 @@ class App(tk.Tk):
                       pady=(0 if row == 0 else 6, 0))
             cell.columnconfigure(1, weight=1)
             ttk.Label(cell, text=label, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
-            tk.Entry(cell, textvariable=var, font=(MONO_FONT, 10), width=7,
-                     relief="solid", borderwidth=1, highlightthickness=0,
-                     background=PANEL, foreground=TEXT, insertbackground=TEXT,
-                     justify="right").grid(row=0, column=1, sticky="ew", padx=(6, 0), ipady=3)
-        for var in (self.var_width, self.var_height):
+            flat_entry(cell, var, (MONO_FONT, 10), justify="right").grid(
+                row=0, column=1, sticky="ew", padx=(6, 0))
+        for var in (self.var_width, self.var_height, self.var_steps, self.var_cfg, self.var_seed):
             var.trace_add("write", self._on_size_var_changed)
-        ttk.Label(params, text="宽高需为 32 的倍数 · 种子 -1 为随机", style="Muted.TLabel").pack(
+        ttk.Label(params, text="宽高需为 128 的倍数 · 种子 -1 为随机", style="Muted.TLabel").pack(
             anchor="w", pady=(PAD, 0))
+        self.var_param_error = tk.StringVar()
+        self.lbl_param_error = ttk.Label(
+            params, textvariable=self.var_param_error, style="Error.TLabel",
+        )
 
-        actions = ttk.Frame(left)
-        actions.pack(fill="x")
-        self.btn_generate = ttk.Button(actions, text="生成", command=self.on_generate,
+        actions = ttk.Frame(left_outer, padding=(0, PAD, 0, 0))
+        actions.place(relx=0, rely=1, anchor="sw", relwidth=1)
+        self.btn_generate = ttk.Button(actions, text="生成图像", command=self.on_generate,
                                        style="Primary.TButton")
         self.btn_generate.pack(side="left", fill="x", expand=True)
-        self.btn_cancel = ttk.Button(actions, text="取消", command=self.on_cancel,
+        self.btn_cancel = ttk.Button(actions, text="取消任务", command=self.on_cancel,
                                      style="Secondary.TButton", state="disabled")
         self.btn_cancel.pack(side="left", padx=(8, 0))
 
@@ -663,30 +859,76 @@ class App(tk.Tk):
         right.rowconfigure(0, weight=1)
         right.columnconfigure(0, weight=1)
 
-        self.canvas = tk.Label(right, background=PANEL, text="生成结果将显示在这里",
-                               foreground=MUTED, font=(UI_FONT, 11),
-                               highlightbackground=BORDER, highlightthickness=1)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
+        preview_stage = tk.Frame(
+            right, background=FIELD_BG, relief="flat", borderwidth=0,
+            highlightbackground=FIELD_BORDER, highlightthickness=1,
+        )
+        preview_stage.grid(row=0, column=0, sticky="nsew")
+        preview_stage.rowconfigure(0, weight=1)
+        preview_stage.columnconfigure(0, weight=1)
+        self.canvas = tk.Label(preview_stage, background=FIELD_BG, borderwidth=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        self.canvas.bind("<Configure>", self._schedule_preview_resize)
+
+        self.empty_preview = tk.Frame(preview_stage, background=FIELD_BG)
+        self.empty_preview.place(relx=0.5, rely=0.47, anchor="center")
+        tk.Label(self.empty_preview, text="◇", background=FIELD_BG, foreground=ACCENT,
+                 font=(UI_FONT, 28)).pack()
+        tk.Label(self.empty_preview, text="等待第一张图像", background=FIELD_BG,
+                 foreground=TEXT, font=(UI_FONT, 13, "bold")).pack(pady=(6, 0))
+        tk.Label(self.empty_preview, text="填写左侧画面描述，按 Ctrl+Enter 开始",
+                 background=FIELD_BG, foreground=MUTED,
+                 font=(UI_FONT, 10)).pack(pady=(6, 0))
 
         preview_actions = ttk.Frame(right)
         preview_actions.grid(row=1, column=0, sticky="ew", pady=(PAD, 0))
+        preview_actions.columnconfigure(0, weight=1)
         self.var_progress = tk.StringVar(value="")
-        ttk.Label(preview_actions, textvariable=self.var_progress, style="Metric.TLabel").pack(side="left")
-        self.btn_save = ttk.Button(preview_actions, text="另存为…", command=self.on_save, state="disabled")
-        self.btn_save.pack(side="right")
+        ttk.Label(preview_actions, textvariable=self.var_progress, style="Metric.TLabel").grid(
+            row=0, column=0, sticky="w")
+        self.progress = ttk.Progressbar(
+            preview_actions, mode="indeterminate", style="Accent.Horizontal.TProgressbar",
+        )
+        self.progress.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.progress.grid_remove()
+        preview_buttons = ttk.Frame(preview_actions)
+        preview_buttons.grid(row=0, column=1, rowspan=2, sticky="e", padx=(PAD, 0))
+        self.btn_open = ttk.Button(
+            preview_buttons, text="打开图片", command=self.on_open_result, state="disabled",
+            style="Compact.TButton",
+        )
+        self.btn_open.pack(side="left")
+        self.btn_save = ttk.Button(
+            preview_buttons, text="另存为…", command=self.on_save, state="disabled",
+            style="Compact.TButton",
+        )
+        self.btn_save.pack(side="left", padx=(8, 0))
+        self.btn_log = ttk.Button(
+            preview_buttons, text="运行记录", command=self._toggle_log,
+            style="Compact.TButton",
+        )
+        self.btn_log.pack(side="left", padx=(8, 0))
+        self.btn_output = ttk.Button(
+            preview_buttons, text="输出目录", command=self.on_open_output_folder,
+            style="Compact.TButton",
+        )
+        self.btn_output.pack(side="left", padx=(8, 0))
 
         # 底部日志
-        log_box = ttk.LabelFrame(self, text=" 日志 ", padding=PAD // 2)
-        log_box.grid(row=2, column=0, sticky="ew", padx=PAD + 4, pady=(PAD, PAD + 4))
-        self.txt_log = tk.Text(log_box, height=5, wrap="none", state="disabled",
+        self.log_box = ttk.LabelFrame(self, text=" 运行记录 ", padding=PAD // 2)
+        self.log_box.grid(row=2, column=0, sticky="ew", padx=PAD + 4, pady=(PAD, PAD + 4))
+        self.txt_log = tk.Text(self.log_box, height=4, wrap="word", state="disabled",
                                font=(MONO_FONT, 9), background=LOG_BG, foreground=LOG_FG,
                                relief="flat", borderwidth=0, padx=8, pady=6)
-        scroll = ttk.Scrollbar(log_box, orient="vertical", command=self.txt_log.yview)
+        scroll = ttk.Scrollbar(self.log_box, orient="vertical", command=self.txt_log.yview)
         self.txt_log.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.txt_log.pack(fill="both", expand=True)
+        self.log_box.grid_remove()
 
         self._on_size_var_changed()
+        self.on_mode()
+        self._sync_ref_buttons()
 
     # ------------------------------------------------------------ 事件通道
 
@@ -703,6 +945,12 @@ class App(tk.Tk):
                     self._update_monitor(*payload)
                 elif kind == "progress":
                     self.var_progress.set(payload)
+                elif kind == "start_done":
+                    self._on_start_done(payload)
+                elif kind == "cancel_done":
+                    self._on_cancel_done(payload)
+                elif kind == "cancelled":
+                    self._on_cancelled(payload)
                 elif kind == "done":
                     self._on_done(payload)
                 elif kind == "fail":
@@ -718,6 +966,30 @@ class App(tk.Tk):
             self.txt_log.delete("1.0", "100.0")
         self.txt_log.see("end")
         self.txt_log.configure(state="disabled")
+
+    def _set_log_visible(self, visible):
+        self.log_visible = visible
+        if visible:
+            self.log_box.grid()
+            self.btn_log.configure(text="收起记录")
+        else:
+            self.log_box.grid_remove()
+            self.btn_log.configure(text="运行记录")
+
+    def _toggle_log(self):
+        self._set_log_visible(not self.log_visible)
+
+    def _on_prompt_changed(self, _event=None):
+        if not self.txt_prompt.edit_modified():
+            return
+        count = len(self.txt_prompt.get("1.0", "end-1c"))
+        self.var_prompt_count.set(f"{count} 字")
+        self.txt_prompt.edit_modified(False)
+
+    def _shortcut_generate(self, _event=None):
+        if str(self.btn_generate.cget("state")) != "disabled":
+            self.on_generate()
+        return "break"
 
     # ------------------------------------------------------------ 监控
 
@@ -742,10 +1014,64 @@ class App(tk.Tk):
 
     def _sync_buttons(self):
         """按当前忙闲与服务状态刷新按钮可用性"""
-        self.btn_generate.configure(state="disabled" if self.busy else "normal")
-        self.btn_cancel.configure(state="normal" if self.busy else "disabled")
-        self.btn_start.configure(state="disabled" if (self.busy or self.server.running()) else "normal")
-        self.btn_stop.configure(state="normal" if self.server.stoppable() else "disabled")
+        blocked = self.busy or self.service_starting
+        if self.force_stopping:
+            generate_text = "正在停止…"
+        elif self.busy:
+            generate_text = "正在生成…"
+        else:
+            generate_text = "开始编辑" if self.var_mode.get() == "edit" else "生成图像"
+        self.btn_generate.configure(
+            text=generate_text,
+            state="disabled" if (blocked or not self._params_valid) else "normal",
+        )
+        cancel_text = "停止中…" if self.force_stopping else (
+            "请求中…" if self.cancel_pending else "取消任务"
+        )
+        self.btn_cancel.configure(
+            text=cancel_text,
+            state="normal"
+            if (self.busy and not self.cancel_pending and not self.force_stopping) else "disabled",
+        )
+        self.btn_start.configure(
+            text="启动中…" if self.service_starting else "启动服务",
+            state="disabled" if (blocked or self.server.running()) else "normal",
+        )
+        self.btn_stop.configure(
+            state="normal" if (self.server.stoppable() and not self.service_starting) else "disabled",
+        )
+
+    def _set_progress_active(self, active):
+        if active:
+            self.progress.grid()
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+            self.progress.grid_remove()
+
+    def _schedule_preview_resize(self, _event=None):
+        if self.preview_source is None:
+            return
+        if self.preview_resize_job is not None:
+            self.after_cancel(self.preview_resize_job)
+        self.preview_resize_job = self.after(80, self._resize_preview)
+
+    def _resize_preview(self):
+        self.preview_resize_job = None
+        if self.preview_source is None:
+            return
+        available_width = max(1, self.canvas.winfo_width() - 24)
+        available_height = max(1, self.canvas.winfo_height() - 24)
+        factor = max(
+            1,
+            math.ceil(self.preview_source.width() / available_width),
+            math.ceil(self.preview_source.height() / available_height),
+        )
+        self.preview = (
+            self.preview_source if factor == 1
+            else self.preview_source.subsample(factor, factor)
+        )
+        self.canvas.configure(image=self.preview, text="")
 
     # ------------------------------------------------------------ 交互
 
@@ -765,28 +1091,65 @@ class App(tk.Tk):
 
     def _on_size_var_changed(self, *_args):
         """宽高变化时同步预设高亮与尺寸提示"""
+        values, error = parse_generation_parameters(
+            self.var_width.get(), self.var_height.get(), self.var_steps.get(),
+            self.var_cfg.get(), self.var_seed.get(),
+        )
+        self._params_valid = values is not None
+        self.var_param_error.set(error or "")
+        if error:
+            self.lbl_param_error.pack(anchor="w", pady=(3, 0))
+        else:
+            self.lbl_param_error.pack_forget()
+
         try:
             current = (int(self.var_width.get()), int(self.var_height.get()))
         except ValueError:
             self.var_size.set("宽高需要是整数")
+            self.strip.set_selected(None)
+            self._sync_buttons()
             return
         megapixels = current[0] * current[1] / 1e6
         self.var_size.set(
             f"当前 {current[0]} × {current[1]}（约 {megapixels:.2f} MP，"
             f"预计 {megapixels * SECONDS_PER_MP:.0f} 秒）"
         )
-        if not hasattr(self, "strip"):
-            return
+        self.strip.set_selected(None)
         for index, (_, width, height) in enumerate(self.active_presets()):
             if (width, height) == current:
                 self.strip.set_selected(index)
-                return
-        self.strip.set_selected(None)
+                break
+        self._sync_buttons()
 
     def on_mode(self):
         editing = self.var_mode.get() == "edit"
-        if editing and self.server.running() and not self.server.with_vision:
-            self.log("提示：当前服务未加载视觉塔，编辑模式需要重启服务。")
+        if editing:
+            self.ref_panel.pack(fill="x", pady=(PAD, 0), after=self.lbl_mode_hint)
+            if self.server.running() and not self.server.with_vision:
+                self.var_mode_hint.set("当前服务未加载编辑能力，生成时会自动重启并加载。")
+                self.lbl_mode_hint.configure(style="Error.TLabel")
+                self.log("提示：当前服务未加载视觉塔，编辑模式生成时会自动重启服务。")
+            else:
+                self.var_mode_hint.set("添加参考图并描述修改；编辑能力会自动加载。")
+                self.lbl_mode_hint.configure(style="Muted.TLabel")
+        else:
+            self.ref_panel.pack_forget()
+            self.var_mode_hint.set("直接描述想要的画面；无需参考图。")
+            self.lbl_mode_hint.configure(style="Muted.TLabel")
+        self._sync_buttons()
+
+    def _sync_ref_buttons(self):
+        selection = self.list_ref.curselection()
+        index = selection[0] if selection else None
+        self.btn_clear_ref.configure(state="normal" if self.ref_paths else "disabled")
+        self.btn_ref_remove.configure(state="normal" if index is not None else "disabled")
+        self.btn_ref_up.configure(
+            state="normal" if index is not None and index > 0 else "disabled",
+        )
+        self.btn_ref_down.configure(
+            state="normal"
+            if index is not None and index < len(self.ref_paths) - 1 else "disabled",
+        )
 
     def _refresh_ref_list(self):
         """按当前顺序重画参考图列表，行首序号即提示词里的图一、图二"""
@@ -797,6 +1160,7 @@ class App(tk.Tk):
             self.var_ref.set(f"已选 {len(self.ref_paths)} 张")
         else:
             self.var_ref.set("未选择")
+        self._sync_ref_buttons()
 
     def on_pick_ref(self):
         paths = filedialog.askopenfilenames(
@@ -816,6 +1180,7 @@ class App(tk.Tk):
         if added:
             self._refresh_ref_list()
             self.var_mode.set("edit")
+            self.on_mode()
 
     def on_clear_ref(self):
         self.ref_paths = []
@@ -834,6 +1199,7 @@ class App(tk.Tk):
         self.ref_paths[index], self.ref_paths[target] = self.ref_paths[target], self.ref_paths[index]
         self._refresh_ref_list()
         self.list_ref.selection_set(target)
+        self._sync_ref_buttons()
 
     def on_remove_ref(self):
         selection = self.list_ref.curselection()
@@ -845,47 +1211,86 @@ class App(tk.Tk):
         self._refresh_ref_list()
         if index < len(self.ref_paths):
             self.list_ref.selection_set(index)
+        elif self.ref_paths:
+            self.list_ref.selection_set(len(self.ref_paths) - 1)
+        self._sync_ref_buttons()
 
     def on_start(self):
-        if self.server.running():
+        if self.server.running() or self.service_starting:
             return
-        self.btn_start.configure(state="disabled")
+        self.service_starting = True
         self._set_state("● 正在加载模型…", "busy")
-        threading.Thread(target=self._start_worker, args=(self.var_vision.get(),), daemon=True).start()
+        self._sync_buttons()
+        with_vision = self.var_mode.get() == "edit"
+        threading.Thread(target=self._start_worker, args=(with_vision,), daemon=True).start()
 
     def _start_worker(self, with_vision):
-        ok, message = self.server.start(with_vision)
+        try:
+            ok, message = self.server.start(with_vision)
+        except Exception as exc:
+            ok, message = False, f"{type(exc).__name__}: {exc}"
         self.emit("log", message)
-        self.events.put(("done", {"started": True} if ok else {"error": message}))
+        self.emit("start_done", {"ok": ok, "message": message})
+
+    def _on_start_done(self, payload):
+        self.service_starting = False
+        self._sync_buttons()
+        if payload["ok"]:
+            self._set_state("● 服务就绪", "ready")
+        else:
+            self._set_state("● 服务未启动", "error")
+            self._set_log_visible(True)
+            messagebox.showerror("启动失败", payload["message"])
+        self.on_mode()
 
     def on_stop(self, force=False):
         if self.busy and not force:
             messagebox.showinfo("提示", "正在生成，请先取消任务；若无法取消可强制停止服务。")
             return
+        if force:
+            self.force_stopping = True
+            self.var_progress.set("正在强制停止服务…")
         self.server.stop()
         self._set_state("● 服务未启动")
+        self.on_mode()
         self._sync_buttons()
 
     def on_cancel(self):
         job = self.server.job_id
         if not job:
+            self.log("任务仍在准备中，暂时没有可取消的任务 ID。")
             return
+        self.cancel_pending = True
+        self._sync_buttons()
+        threading.Thread(target=self._cancel_worker, args=(job,), daemon=True).start()
+
+    def _cancel_worker(self, job):
         try:
             self.server.cancel(job)
-            self.log("已请求取消任务。")
+            self.emit("cancel_done", ("ok", "已请求取消任务。"))
         except urllib.error.HTTPError as exc:
-            # 该版本 capabilities 里 cancel_generating=false，运行中的任务无法中断
             if exc.code == 409:
-                self.log("服务端不支持中断正在生成的画面（cancel_generating=false）。")
-                if messagebox.askyesno(
-                    "无法取消",
-                    "当前版本无法中断正在进行的生成。\n是否强制停止服务？这会中断本次生成并立即释放显存与内存。",
-                ):
-                    self.on_stop(force=True)
-                return
-            self.log(f"取消失败：HTTP {exc.code}")
+                self.emit("cancel_done", ("unsupported", None))
+            else:
+                self.emit("cancel_done", ("error", f"取消失败：HTTP {exc.code}"))
         except Exception as exc:
-            self.log(f"取消失败：{exc}")
+            self.emit("cancel_done", ("error", f"取消失败：{exc}"))
+
+    def _on_cancel_done(self, payload):
+        outcome, message = payload
+        self.cancel_pending = False
+        self._sync_buttons()
+        if outcome == "ok":
+            self.log(message)
+        elif outcome == "unsupported":
+            self.log("服务端不支持中断正在生成的画面（cancel_generating=false）。")
+            if self.busy and messagebox.askyesno(
+                "无法取消",
+                "当前版本无法中断正在进行的生成。\n是否强制停止服务？这会中断本次生成并立即释放显存与内存。",
+            ):
+                self.on_stop(force=True)
+        else:
+            self.log(message)
 
     def on_save(self):
         if not self.result_path or not Path(self.result_path).is_file():
@@ -898,56 +1303,87 @@ class App(tk.Tk):
             Path(target).write_bytes(Path(self.result_path).read_bytes())
             self.log(f"已保存到 {target}")
 
+    def on_open_result(self):
+        if self.result_path and Path(self.result_path).is_file():
+            try:
+                os.startfile(str(self.result_path))
+            except OSError as exc:
+                messagebox.showerror("无法打开图片", str(exc))
+
+    def on_open_output_folder(self):
+        try:
+            OUTPUTS.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(OUTPUTS))
+        except OSError as exc:
+            messagebox.showerror("无法打开输出目录", str(exc))
+
     # ------------------------------------------------------------ 生成
 
     def on_generate(self):
-        if self.busy:
+        if self.busy or self.service_starting:
             return
         prompt = self.txt_prompt.get("1.0", "end").strip()
         if not prompt:
-            messagebox.showwarning("提示", "请先填写提示词。")
+            messagebox.showwarning("缺少画面描述", "请先描述想要生成的画面。")
+            self.txt_prompt.focus_set()
             return
 
         editing = self.var_mode.get() == "edit"
         if editing and not self.ref_paths:
-            messagebox.showwarning("提示", "图像编辑模式需要先选择至少一张参考图。")
+            messagebox.showwarning("缺少参考图", "图像编辑模式需要至少一张参考图。")
             return
 
-        try:
-            width, height = int(self.var_width.get()), int(self.var_height.get())
-            steps = int(self.var_steps.get())
-            cfg = float(self.var_cfg.get())
-            seed = int(self.var_seed.get())
-        except ValueError:
-            messagebox.showwarning("提示", "参数必须是数字。")
+        params, error = parse_generation_parameters(
+            self.var_width.get(), self.var_height.get(), self.var_steps.get(),
+            self.var_cfg.get(), self.var_seed.get(),
+        )
+        if error:
+            messagebox.showwarning("参数有误", error)
             return
-        if width % 128 or height % 128:
-            messagebox.showwarning(
-                "提示",
-                "宽和高必须是 128 的倍数。\n\n"
-                "解码按瓦片分块进行，尺寸不在 128 网格上会在接缝处出现亮度台阶。\n"
-                "常用可用值：1024、1152、1280、1408、1536、1792、2048。",
-            )
-            return
+        width, height, steps, cfg, seed = params
+        request = {
+            "prompt": prompt,
+            "negative_prompt": self.var_negative.get().strip(),
+            "editing": editing,
+            "ref_paths": tuple(self.ref_paths),
+            "with_vision": editing,
+            "width": width,
+            "height": height,
+            "steps": steps,
+            "cfg": cfg,
+            "seed": seed,
+        }
 
         self.busy = True
-        self.btn_generate.configure(state="disabled")
-        self.btn_cancel.configure(state="normal")
-        self.btn_start.configure(state="disabled")
-        self.var_progress.set("准备中…")
+        self.server.job_id = None
+        estimate = width * height / 1e6 * SECONDS_PER_MP
+        estimate_text = (
+            f"基础生成约 {estimate:.0f} 秒，图像编辑会更久"
+            if editing else f"预计约 {estimate:.0f} 秒"
+        )
+        self.var_progress.set(f"准备中 · {estimate_text}")
         self._set_state("● 生成中", "busy")
+        self._set_progress_active(True)
+        self._sync_buttons()
 
         threading.Thread(
             target=self._generate_worker,
-            args=(prompt, editing, width, height, steps, cfg, seed),
+            args=(request,),
             daemon=True,
         ).start()
 
-    def _generate_worker(self, prompt, editing, width, height, steps, cfg, seed):
+    def _generate_worker(self, request):
+        prompt = request["prompt"]
+        editing = request["editing"]
+        width = request["width"]
+        height = request["height"]
+        steps = request["steps"]
+        cfg = request["cfg"]
+        seed = request["seed"]
         try:
             if not server_alive():
                 self.emit("log", "服务未运行，正在启动…")
-                ok, message = self.server.start(self.var_vision.get())
+                ok, message = self.server.start(request["with_vision"])
                 if not ok:
                     self.emit("fail", message)
                     return
@@ -963,7 +1399,7 @@ class App(tk.Tk):
                             f"步数 {steps} 引导 {cfg}")
             payload = {
                 "prompt": prompt,
-                "negative_prompt": self.var_negative.get().strip(),
+                "negative_prompt": request["negative_prompt"],
                 "width": width,
                 "height": height,
                 "seed": seed if seed >= 0 else -1,
@@ -983,13 +1419,13 @@ class App(tk.Tk):
                 # 顺序即提示词里的图一、图二：服务端按数组顺序逐张编码，
                 # increase_ref_index 让每张参考图拿到递增的位置索引，模型据此区分它们
                 images = []
-                for path in self.ref_paths:
+                for path in request["ref_paths"]:
                     data = base64.b64encode(path.read_bytes()).decode("ascii")
                     images.append(f"data:image/png;base64,{data}")
                 payload["ref_images"] = images
                 payload["increase_ref_index"] = True
                 self.emit("log", "参考图顺序：" + "，".join(
-                    f"图{i} {p.name}" for i, p in enumerate(self.ref_paths, start=1)))
+                    f"图{i} {p.name}" for i, p in enumerate(request["ref_paths"], start=1)))
 
             job_id = self.server.submit(payload)
             if not job_id:
@@ -1008,7 +1444,7 @@ class App(tk.Tk):
                 break
 
             if status == "cancelled":
-                self.emit("fail", "任务已取消。")
+                self.emit("cancelled", "任务已取消。")
                 return
             if status != "completed":
                 error = (info.get("error") or {}).get("message") or "未知错误"
@@ -1031,36 +1467,53 @@ class App(tk.Tk):
         except Exception as exc:
             self.emit("fail", f"{type(exc).__name__}: {exc}")
 
+    def _on_cancelled(self, message):
+        self.busy = False
+        self.cancel_pending = False
+        self.server.job_id = None
+        self._set_progress_active(False)
+        self._sync_buttons()
+        self.var_progress.set(message)
+        self._set_state("● 服务就绪", "ready")
+        self.log(message)
+
     def _on_done(self, payload):
         self.busy = False
+        self.cancel_pending = False
+        self.server.job_id = None
+        self._set_progress_active(False)
         self._sync_buttons()
-
-        if payload.get("started"):
-            self._set_state("● 服务就绪", "ready")
-            self.log("服务已就绪。模型在首次出图时载入，之后常驻，连续出图不再重复加载。")
-            return
-        if "error" in payload:
-            self._set_state("● 服务未启动")
-            messagebox.showerror("启动失败", payload["error"])
-            return
 
         path = Path(payload["path"])
         self.result_path = path
         self._show_image(path)
         self.btn_save.configure(state="normal")
-        self.var_progress.set(f"完成，耗时 {payload['elapsed']:.1f} 秒")
+        self.btn_open.configure(state="normal")
+        self.var_progress.set(f"{path.name} · 耗时 {payload['elapsed']:.1f} 秒")
         self._set_state("● 服务就绪", "ready")
+        self.on_mode()
         self.log(f"完成：{path}")
 
     def _on_fail(self, message):
+        intentionally_stopped = self.force_stopping
+        self.force_stopping = False
         self.busy = False
+        self.cancel_pending = False
+        self.server.job_id = None
+        self._set_progress_active(False)
         self._sync_buttons()
         self.var_progress.set("已停止")
         if self.server.running():
             self._set_state("● 服务就绪", "ready")
         else:
             self._set_state("● 服务未启动")
+        self.on_mode()
+        if intentionally_stopped:
+            self.var_progress.set("已强制停止")
+            self.log("任务已因服务停止而中断。")
+            return
         self.log(f"[失败] {message}")
+        self._set_log_visible(True)
         messagebox.showerror("生成失败", message)
 
     def _show_image(self, path):
@@ -1069,11 +1522,9 @@ class App(tk.Tk):
         except Exception as exc:
             self.log(f"预览失败：{exc}")
             return
-        factor = max(1, -(-max(image.width(), image.height()) // 700))
-        if factor > 1:
-            image = image.subsample(factor, factor)
-        self.preview = image  # 保持引用，否则会被回收
-        self.canvas.configure(image=image, text="")
+        self.preview_source = image
+        self.empty_preview.place_forget()
+        self._resize_preview()
 
     # ------------------------------------------------------------ 退出
 
