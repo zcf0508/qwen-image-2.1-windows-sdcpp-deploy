@@ -34,9 +34,9 @@ $env:PATH = "$BinDir;$env:PATH"
 $DiffusionModel = Join-Path $Models 'Qwen-Image-2.1-Q4_K_M-HQv3.gguf'
 $Vae            = Join-Path $Models 'vae\qwen_image_2.1_vae_bf16.safetensors'
 
-# 文本编码器按优先级自动选择：GGUF 版元数据完整，兼容性最好；
-# safetensors 版（int8 convrot）作为备选。
+# 优先使用 Heretic GGUF；不存在时回退官方编码器。
 $TextEncoder = @(
+    (Join-Path $Models 'text_encoders\qwen3vl_8b_heretic-Q4_K_M.gguf')
     (Join-Path $Models 'text_encoders\Qwen3VL-8B-Instruct-Q4_K_M.gguf')
     (Join-Path $Models 'text_encoders\qwen3vl_8b_int8_convrot.safetensors')
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1

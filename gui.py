@@ -37,8 +37,9 @@ OUTPUTS = ROOT / "outputs"
 DIFFUSION_MODEL = ROOT / "models" / "Qwen-Image-2.1-Q4_K_M-HQv3.gguf"
 VAE_MODEL = ROOT / "models" / "vae" / "qwen_image_2.1_vae_bf16.safetensors"
 
-# 文本编码器优先用 GGUF（元数据完整），safetensors 作为备选
+# 优先使用 Heretic GGUF；不存在时回退官方编码器
 TEXT_ENCODERS = (
+    ROOT / "models" / "text_encoders" / "qwen3vl_8b_heretic-Q4_K_M.gguf",
     ROOT / "models" / "text_encoders" / "Qwen3VL-8B-Instruct-Q4_K_M.gguf",
     ROOT / "models" / "text_encoders" / "qwen3vl_8b_int8_convrot.safetensors",
 )
