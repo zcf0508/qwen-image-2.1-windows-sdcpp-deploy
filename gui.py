@@ -992,6 +992,11 @@ class App(tk.Tk):
         self.progress.grid_remove()
         preview_buttons = ttk.Frame(preview_actions)
         preview_buttons.grid(row=0, column=1, rowspan=2, sticky="e", padx=(PAD, 0))
+        self.btn_close_preview = ttk.Button(
+            preview_buttons, text="关闭预览", command=self.on_close_preview, state="disabled",
+            style="Compact.TButton",
+        )
+        self.btn_close_preview.pack(side="left", padx=(0, 8))
         self.btn_open = ttk.Button(
             preview_buttons, text="打开图片", command=self.on_open_result, state="disabled",
             style="Compact.TButton",
@@ -1431,6 +1436,16 @@ class App(tk.Tk):
         else:
             self.log(message)
 
+    def on_close_preview(self):
+        if self.preview_resize_job is not None:
+            self.after_cancel(self.preview_resize_job)
+            self.preview_resize_job = None
+        self.canvas.configure(image="", text="")
+        self.preview = None
+        self.preview_source = None
+        self.empty_preview.place(relx=0.5, rely=0.47, anchor="center")
+        self.btn_close_preview.configure(state="disabled")
+
     def on_save(self):
         if not self.result_path or not Path(self.result_path).is_file():
             return
@@ -1664,6 +1679,7 @@ class App(tk.Tk):
         self.preview_source = image
         self.empty_preview.place_forget()
         self._resize_preview()
+        self.btn_close_preview.configure(state="normal")
 
     # ------------------------------------------------------------ 退出
 
