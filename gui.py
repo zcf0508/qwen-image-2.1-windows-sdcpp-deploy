@@ -122,6 +122,100 @@ def vram_usage(pid=None):
         return None
 
 
+# ---------------------------------------------------------------- 文件拖放
+
+WM_DROPFILES = 0x0233
+GWLP_WNDPROC = -4
+
+
+class FileDropTarget:
+    """接管窗口过程，让窗口接收系统投递的文件拖放（WM_DROPFILES）
+
+    只用 ctypes 调 user32 / shell32，不引入 tkinterdnd2 这类第三方包。
+    文件落到窗口上时系统会把路径打包成 HDROP 投递给窗口过程，这里先取走路径，
+    再把消息交回 Tk 原来的窗口过程。
+
+    Tk 在 Windows 上把整个顶层窗口画在一个包装窗口（类名 TkTopLevel）里，Tk 自己的
+    窗口是它的子窗口，所以要把拖放注册在包装窗口上，窗口内任意位置都能收到。
+    包装窗口要等窗口显示出来才存在，拿不到时直接报错由调用方稍后重试。
+    """
+
+    def __init__(self, window, on_drop):
+        self.on_drop = on_drop
+        self.user32 = user32 = ctypes.WinDLL("user32", use_last_error=True)
+        # 句柄与函数指针都是指针宽度，64 位下必须显式声明，否则会被截断
+        user32.GetParent.argtypes = [ctypes.c_void_p]
+        user32.GetParent.restype = ctypes.c_void_p
+        user32.CallWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+                                           ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.CallWindowProcW.restype = ctypes.c_ssize_t
+        set_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+        set_long.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        set_long.restype = ctypes.c_void_p
+
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.DragAcceptFiles.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+        shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                           ctypes.c_wchar_p, ctypes.c_uint]
+        shell32.DragQueryFileW.restype = ctypes.c_uint
+        shell32.DragFinish.argtypes = [ctypes.c_void_p]
+        self._shell32 = shell32
+
+        self.hwnd = user32.GetParent(window.winfo_id())
+        if not self.hwnd:
+            raise OSError("窗口还没显示出顶层 HWND")
+        self._proc = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
+            ctypes.c_size_t, ctypes.c_ssize_t)(self._handle)
+        # 回调必须留引用，否则被回收后窗口过程会跳到野指针
+        self._previous = set_long(self.hwnd, GWLP_WNDPROC,
+                                  ctypes.cast(self._proc, ctypes.c_void_p))
+        if not self._previous:
+            raise OSError("接管窗口过程失败")
+        try:
+            # 注册后系统才会在有文件落到窗口上时投递 WM_DROPFILES
+            shell32.DragAcceptFiles(self.hwnd, True)
+        except Exception:
+            # 注册失败就把窗口过程还原，别留下会跳野指针的回调
+            set_long(self.hwnd, GWLP_WNDPROC, self._previous)
+            raise
+
+    def _handle(self, hwnd, message, wparam, lparam):
+        if message != WM_DROPFILES:
+            return self.user32.CallWindowProcW(self._previous, hwnd, message, wparam, lparam)
+        try:
+            paths = self._take_paths(wparam)
+        except Exception:
+            paths = []
+        if paths:
+            self.on_drop(paths)
+        # 已消费，不再往下传
+        return 0
+
+    def _take_paths(self, hdrop):
+        """读出 HDROP 里的全部路径并释放它（传 0xFFFFFFFF 取文件个数）"""
+        count = self._shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+        paths = []
+        for index in range(count):
+            need = self._shell32.DragQueryFileW(hdrop, index, None, 0)
+            buffer = ctypes.create_unicode_buffer(need + 1)
+            self._shell32.DragQueryFileW(hdrop, index,
+                                         ctypes.cast(buffer, ctypes.c_wchar_p), need + 1)
+            paths.append(Path(buffer.value))
+        self._shell32.DragFinish(hdrop)
+        return paths
+
+
+def enable_file_drop(window, on_drop):
+    """给窗口挂上文件拖放，成功返回接管对象，系统不支持或失败返回 None"""
+    if sys.platform != "win32":
+        return None
+    try:
+        return FileDropTarget(window, on_drop)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------- 服务进程
 
 def bind_child_lifetime(process):
@@ -495,10 +589,14 @@ class App(tk.Tk):
         self.start_time = 0.0
         self._params_valid = True
         self.log_visible = False
+        self.drop = None
+        self._drop_giveup = None
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.bind("<Control-Return>", self._shortcut_generate)
+        # 拖放要等窗口映射后才装得上：Tk 到那时才建好真正的顶层 HWND
+        self.bind("<Map>", self._enable_drop, add="+")
         self.after(100, self._drain)
         self.after_idle(self.txt_prompt.focus_set)
         threading.Thread(target=self._monitor_loop, daemon=True).start()
@@ -943,6 +1041,8 @@ class App(tk.Tk):
                     self.log(payload)
                 elif kind == "monitor":
                     self._update_monitor(*payload)
+                elif kind == "drop":
+                    self.on_files_dropped(payload)
                 elif kind == "progress":
                     self.var_progress.set(payload)
                 elif kind == "start_done":
@@ -1130,7 +1230,7 @@ class App(tk.Tk):
                 self.lbl_mode_hint.configure(style="Error.TLabel")
                 self.log("提示：当前服务未加载视觉塔，编辑模式生成时会自动重启服务。")
             else:
-                self.var_mode_hint.set("添加参考图并描述修改；编辑能力会自动加载。")
+                self.var_mode_hint.set("添加参考图并描述修改（图片也可直接拖进窗口）；编辑能力会自动加载。")
                 self.lbl_mode_hint.configure(style="Muted.TLabel")
         else:
             self.ref_panel.pack_forget()
@@ -1170,6 +1270,10 @@ class App(tk.Tk):
         )
         if not paths:
             return
+        self._add_refs(paths)
+
+    def _add_refs(self, paths):
+        """把图片追加到参考图列表（重复的跳过），有新增就切到图像编辑模式"""
         added = 0
         for raw in paths:
             candidate = Path(raw)
@@ -1181,6 +1285,40 @@ class App(tk.Tk):
             self._refresh_ref_list()
             self.var_mode.set("edit")
             self.on_mode()
+        return added
+
+    def _enable_drop(self, _event=None):
+        """把拖放挂到顶层窗口上。装成之前每个子控件显示出来都会触发一次 <Map>，
+        而顶层窗口要等窗口真正显示才有，所以按时间给 3 秒预算一直重试，别按次数算。"""
+        if self.drop is not None:
+            return
+        if self._drop_giveup is None:
+            self._drop_giveup = time.monotonic() + 3
+        self.drop = enable_file_drop(self, self._queue_drop)
+        if self.drop is not None:
+            self.log("图片可直接拖进窗口，按顺序加进参考图列表。")
+        elif time.monotonic() < self._drop_giveup:
+            self.after(50, self._enable_drop)
+        else:
+            self.log("提示：本机未能启用拖放，请用「选择参考图…」添加图片。")
+
+    def _queue_drop(self, paths):
+        """窗口过程里只入队：在那里动控件会撞上系统同步消息的重入，Tk 操作交给 _drain"""
+        self.events.put(("drop", paths))
+
+    def on_files_dropped(self, paths):
+        """拖进窗口的文件：图片加进参考图列表，其余只记一条日志"""
+        images = [path for path in paths
+                  if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES]
+        others = [path.name for path in paths if path not in images]
+        if others:
+            self.log("已忽略非图片内容：" + "，".join(others))
+        if not images:
+            return
+        if self._add_refs(images):
+            self.log(f"拖入 {len(images)} 张图片，参考图共 {len(self.ref_paths)} 张。")
+        else:
+            self.log("拖入的图片已在参考图里，未重复添加。")
 
     def on_clear_ref(self):
         self.ref_paths = []
