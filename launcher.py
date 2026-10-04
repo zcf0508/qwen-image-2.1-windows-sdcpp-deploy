@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent
 SD_CLI = ROOT / "bin" / "sd-cli.exe"
 OUTPUTS = ROOT / "outputs"
 
-# 与 gui.py 用同一份扩散模型；HQv3 需先打补丁，见 README「量化版本选择」
+# 与图形界面（gui-go）用同一份扩散模型；HQv3 需先打补丁，见 README「量化版本选择」
 DIFFUSION_MODEL = ROOT / "models" / "Qwen-Image-2.1-Q4_K_M-HQv3.gguf"
 VAE_MODEL = ROOT / "models" / "vae" / "qwen_image_2.1_vae_bf16.safetensors"
 

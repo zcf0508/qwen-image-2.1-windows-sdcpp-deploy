@@ -322,7 +322,7 @@ Say ('=' * 66)
 Ok '安装完成'
 Say ''
 Say '下一步：'
-Say '   uv run --no-project gui.py'
+Say '   cd gui-go; go run .   （需要 Go 1.27+，仓库根的 mise.toml 已钉版本）'
 Say ''
 Say '   打开界面后点「启动服务」，填提示词，点「生成」。首次出图需载入权重，'
 Say '   约两分钟；之后连续出图不再重复加载。'

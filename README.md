@@ -12,8 +12,9 @@
 # 1. 准备环境并下载依赖，首次约 13 GB
 .\setup.ps1
 
-# 2. 启动图形界面
-uv run --no-project gui.py
+# 2. 启动图形界面（Go 1.27+，仓库根的 mise.toml 已钉版本）
+cd gui-go
+go run .
 
 # 3. 填写画面描述 → 点「生成图像」（服务会按需自动启动）
 ```
@@ -31,7 +32,7 @@ uv run --no-project gui.py
 ```
 <仓库根目录>\
 ├── setup.ps1                       安装脚本：环境检查、依赖下载校验、解压落位、设备自检
-├── gui.py                          图形界面（uv run，推荐入口）
+├── gui-go\                         图形界面（Go + MyGo 原生 UI，推荐入口）
 ├── launcher.py                     命令行启动器（uv run）
 ├── run.ps1                         PowerShell 生成脚本
 ├── patch_gguf_img_in.py            维护用：修正 ComfyUI-GGUF 导出模型的形状声明
@@ -86,15 +87,16 @@ uv run --no-project patch_gguf_img_in.py
 
 同种子、同提示词、同参数对比，HQv3 在细节上略好，但差距有限：普通版皮肤纹理同样扎实，但有一根手指比例失调、键盘黑键排列错乱；HQv3 不再有比例失调的长指、背景手更清楚，代价是出现了缺指。手部结构仍是 7B 加 4 比特量化的能力边界，换量化版本解决不了这个层面。
 
-想换回普通量化：把 `gui.py`、`launcher.py`、`run.ps1` 里的模型文件名改回 `qwen-image-2.1-Q4_K_M.gguf`，那个文件仍在原处。
+想换回普通量化：把 `gui-go\server.go`、`launcher.py`、`run.ps1` 里的模型文件名改回 `qwen-image-2.1-Q4_K_M.gguf`，那个文件仍在原处。
 
-## 图形界面 gui.py
+## 图形界面 gui-go
 
 ```powershell
-uv run --no-project gui.py
+cd gui-go
+go run .          # 开发时可用 go tool mygo dev，改代码自动重启
 ```
 
-纯标准库 + tkinter，零第三方依赖，不需要构建。控件采用扁平填充、单线聚焦态和统一悬停色，避开系统默认的立体边框与阴影。界面分四块：
+Go + [MyGo](https://mygo.egoist.dev/) 原生界面：无 webview、无 cgo，Windows 上用 Direct3D 11 绘制，单个小体积可执行文件。`go tool mygo build` 产出独立 exe 与 NSIS 安装包（在 `gui-go\build\`）。`go test` 在无窗口环境渲染视图做回归测试。界面分四块：
 
 | 区域 | 内容 |
 | --- | --- |
@@ -301,7 +303,7 @@ total params memory size = 10629.76MB (VRAM 6327.42MB, RAM 4302.33MB):
 - 上游基座模型 [Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) 适用 **Qwen Research License**：默认供研究与评估使用，商用需另行取得授权。本仓库的脚本与文档不改变该许可，下载并使用模型即表示你接受其条款。
 - 量化权重出自 realrebelai 的 [Qwen-Image-2.1_GGUFs](https://huggingface.co/realrebelai/Qwen-Image-2.1_GGUFs)（HQv3 混合精度方案）。本仓使用的 HQv3 文件只修正了一处元数据，使 stable-diffusion.cpp 能正确推断网络规模，量化本身未做任何改动；修正过程与原理见 [修正仓库](https://huggingface.co/zcf0508/qwen-image-2.1-hqv3-sdcpp-fixed)。
 - 推理后端为 [leejet/stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)，版本钉死在 `master-889-c678dfe`。
-- 本仓库的脚本与文档（`setup.ps1`、`gui.py`、`launcher.py`、`run.ps1`、`patch_gguf_img_in.py`）可自由使用与修改。
+- 本仓库的脚本与文档（`setup.ps1`、`gui-go`、`launcher.py`、`run.ps1`、`patch_gguf_img_in.py`）可自由使用与修改。
 
 ## 维护
 
