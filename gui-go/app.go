@@ -32,7 +32,7 @@ type app struct {
 	mode        string // txt2img | edit
 	refPaths    []string
 	refSelected int
-	refList     ui.ListState
+	refThumbs   map[string]*ui.Bitmap // 参考图缩略图，加入时解码一次
 	prompt      string
 	negative    string
 
@@ -59,6 +59,9 @@ type app struct {
 	closeConfirmed  bool
 	adoptedNotified bool
 	editWarnLogged  bool
+	genStarted      time.Time
+	genEstimate     float64 // 本次生成的预计秒数，画进度条用
+	genAspect       float32 // 本次生成的宽高比，画占位画框用
 	done            chan struct{}
 }
 
@@ -66,6 +69,7 @@ func newApp() *app {
 	a := &app{
 		mode:        "txt2img",
 		refSelected: -1,
+		refThumbs:   map[string]*ui.Bitmap{},
 		width:       "1024",
 		height:      "1024",
 		steps:       "40",
@@ -79,7 +83,6 @@ func newApp() *app {
 	}
 	a.stateText = stateIdleText
 	a.server = &QwenServer{logf: a.logf}
-	a.refList.Selected = &a.refSelected
 	a.refreshParams()
 	a.appendLog("就绪。填写画面描述后按 Ctrl+Enter；服务未启动时会自动加载。")
 	return a
@@ -156,6 +159,23 @@ func (a *app) choosePreset(p sizePreset) {
 	a.refreshParams()
 }
 
+// setHD 切换标准/高清档，并把当前选中的比例换成新档里同比例的尺寸；
+// 自定义尺寸保持不变。
+func (a *app) setHD(on bool) {
+	label := ""
+	if i := a.selectedPreset(); i >= 0 {
+		label = a.activePresets()[i].label
+	}
+	a.hd = on
+	for _, p := range a.activePresets() {
+		if p.label == label {
+			a.choosePreset(p)
+			return
+		}
+	}
+	a.refreshParams()
+}
+
 func (a *app) selectedPreset() int {
 	w, werr := parseInt(a.width)
 	h, herr := parseInt(a.height)
@@ -189,12 +209,32 @@ func (a *app) addRefs(paths []string) int {
 			continue
 		}
 		a.refPaths = append(a.refPaths, raw)
+		a.refThumbs[raw] = loadThumb(raw)
 		added++
 	}
 	if added > 0 {
 		a.mode = "edit"
 	}
 	return added
+}
+
+func (a *app) clearRefs() {
+	a.refPaths = nil
+	a.refSelected = -1
+	clear(a.refThumbs)
+}
+
+// loadThumb 解码参考图做缩略图；读不了的图返回 nil，界面显示文件名占位。
+func loadThumb(path string) *ui.Bitmap {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	bitmap, err := ui.DecodeBitmap(data)
+	if err != nil {
+		return nil
+	}
+	return bitmap
 }
 
 func (a *app) filesDropped(paths []string) {
@@ -265,6 +305,7 @@ func (a *app) removeRef() {
 		a.appendLog("先在列表里点一张参考图，再移除。")
 		return
 	}
+	delete(a.refThumbs, a.refPaths[i])
 	a.refPaths = slices.Delete(a.refPaths, i, i+1)
 	switch {
 	case i < len(a.refPaths):
@@ -283,7 +324,7 @@ func (a *app) startService() {
 		return
 	}
 	a.serviceStarting = true
-	a.setState("● 正在加载模型…", "busy")
+	a.setState("正在加载模型…", "busy")
 	withVision := a.mode == "edit"
 	go func() {
 		ok, message := a.server.Start(withVision, 300*time.Second)
@@ -399,8 +440,11 @@ func (a *app) generate() {
 	} else {
 		a.progressText = fmt.Sprintf("准备中 · 预计约 %.0f 秒", estimate)
 	}
-	a.setState("● 生成中…", "busy")
+	a.setState("生成中…", "busy")
 	a.progressActive = true
+	a.genStarted = time.Now()
+	a.genEstimate = estimate
+	a.genAspect = float32(params.width) / float32(params.height)
 
 	go a.generateWorker(req)
 }

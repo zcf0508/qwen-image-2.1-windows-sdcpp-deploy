@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/egoist/mygo/ui"
@@ -119,7 +120,7 @@ func TestBuildPayloadMissingRef(t *testing.T) {
 func TestViewInitial(t *testing.T) {
 	a := newApp()
 	tt := ui.NewTester(a.view, 1280, 800)
-	for _, text := range []string{"Qwen Image", "本地创作台", stateIdleText, "文生图", "图像编辑", "画面描述", "生成图像", "等待第一张图像"} {
+	for _, text := range []string{"Qwen Image", "本地创作台", stateIdleText, "文生图", "图像编辑", "画面描述", "生成图像", "Ctrl+Enter 生成"} {
 		if !tt.HasText(text) {
 			t.Errorf("initial view missing %q; texts %q", text, tt.Texts())
 		}
@@ -140,6 +141,48 @@ func TestViewPresetTiles(t *testing.T) {
 	}
 }
 
+// 切换高清档要保留选中的比例，而不是让宽高停在旧档的尺寸上。
+func TestSetHDKeepsAspect(t *testing.T) {
+	a := newApp()
+	a.choosePreset(sizePreset{"16:9", 1152, 640})
+	a.setHD(true)
+	if a.width != "2048" || a.height != "1152" {
+		t.Fatalf("16:9 in HD: %sx%s, want 2048x1152", a.width, a.height)
+	}
+	if i := a.selectedPreset(); i < 0 || a.activePresets()[i].label != "16:9" {
+		t.Errorf("16:9 must stay selected in HD, got index %d", i)
+	}
+	a.setHD(false)
+	if a.width != "1152" || a.height != "640" {
+		t.Errorf("back to standard: %sx%s, want 1152x640", a.width, a.height)
+	}
+
+	// 自定义尺寸不属于任何预设，切档时原样保留
+	a.width, a.height = "896", "1280"
+	a.refreshParams()
+	a.setHD(true)
+	if a.width != "896" || a.height != "1280" || !a.hd {
+		t.Errorf("custom size must be kept: %sx%s hd=%v", a.width, a.height, a.hd)
+	}
+}
+
+func TestViewHDSwitchKeepsTile(t *testing.T) {
+	a := newApp()
+	tt := ui.NewTester(a.view, 1280, 800)
+	if err := tt.Click("尺寸 3:4"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tt.Click("高清档"); err != nil {
+		t.Fatal(err)
+	}
+	if !a.hd || a.width != "1152" || a.height != "1536" {
+		t.Errorf("after HD switch: hd=%v %sx%s, want 1152x1536", a.hd, a.width, a.height)
+	}
+	if !tt.HasText("1152 × 1536") {
+		t.Errorf("view not updated; texts %q", tt.Texts())
+	}
+}
+
 func TestViewParamValidation(t *testing.T) {
 	a := newApp()
 	a.width = "1000"
@@ -147,6 +190,9 @@ func TestViewParamValidation(t *testing.T) {
 	tt := ui.NewTester(a.view, 1280, 800)
 	if !tt.HasText("宽和高必须是 128 的倍数，避免分块接缝") {
 		t.Errorf("param error not shown; texts %q", tt.Texts())
+	}
+	if !tt.HasText("自定义 · 1000×1024") {
+		t.Errorf("composer size chip not updated; texts %q", tt.Texts())
 	}
 	if a.generateEnabled() {
 		t.Error("generate must stay disabled while params are invalid")
@@ -156,17 +202,86 @@ func TestViewParamValidation(t *testing.T) {
 func TestViewEditMode(t *testing.T) {
 	a := newApp()
 	tt := ui.NewTester(a.view, 1280, 800)
-	if tt.HasText("选择参考图…") {
-		t.Error("ref panel must stay hidden in txt2img mode")
+	if tt.HasText("拖入图片，或点击选择参考图") {
+		t.Error("ref strip must stay hidden in txt2img mode")
 	}
 	if err := tt.Click("图像编辑"); err != nil {
 		t.Fatal(err)
 	}
 	if a.mode != "edit" {
-		t.Fatalf("mode %q after clicking radio", a.mode)
+		t.Fatalf("mode %q after clicking segment", a.mode)
 	}
-	if !tt.HasText("选择参考图…") {
-		t.Errorf("ref panel not shown in edit mode; texts %q", tt.Texts())
+	if !tt.HasText("拖入图片，或点击选择参考图") || !tt.HasText("开始编辑") {
+		t.Errorf("edit mode not reflected; texts %q", tt.Texts())
+	}
+	if err := tt.Click("文生图"); err != nil {
+		t.Fatal(err)
+	}
+	if a.mode != "txt2img" {
+		t.Errorf("mode %q after switching back", a.mode)
+	}
+}
+
+// 缩略图上的按钮作用于它所在的那一张，而不是之前选中的那一张。
+func TestViewRefTileActions(t *testing.T) {
+	a := newApp()
+	a.addRefs([]string{`C:\a.png`, `C:\b.png`, `C:\c.png`})
+	a.refSelected = 2
+	tt := ui.NewTester(a.view, 1280, 800)
+	// 选中第 3 张时它的操作条可见；左移后应排到第 2 位，且仍选中
+	if err := tt.Click("左移"); err != nil {
+		t.Fatalf("%v; texts %q", err, tt.Texts())
+	}
+	want := []string{`C:\a.png`, `C:\c.png`, `C:\b.png`}
+	if !slices.Equal(a.refPaths, want) || a.refSelected != 1 {
+		t.Fatalf("after move left: %v, selected %d", a.refPaths, a.refSelected)
+	}
+	if err := tt.Click("移除"); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{`C:\a.png`, `C:\b.png`}; !slices.Equal(a.refPaths, want) {
+		t.Errorf("after remove: %v", a.refPaths)
+	}
+	if _, ok := a.refThumbs[`C:\c.png`]; ok {
+		t.Error("removed ref must drop its thumbnail")
+	}
+	if err := tt.Click("参考图 1"); err != nil {
+		t.Fatal(err)
+	}
+	if a.refSelected != 0 {
+		t.Errorf("clicking tile 1 must select it, selected %d", a.refSelected)
+	}
+}
+
+func TestViewNegativeToggle(t *testing.T) {
+	a := newApp()
+	tt := ui.NewTester(a.view, 1280, 800)
+	if _, ok := tt.Find("负面提示词"); !ok {
+		t.Fatalf("negative toggle missing; texts %q", tt.Texts())
+	}
+	if err := tt.Click("负面提示词"); err != nil {
+		t.Fatal(err)
+	}
+	if !tt.HasText("不想出现") {
+		t.Errorf("negative input not opened; texts %q", tt.Texts())
+	}
+	a.negative = "水印"
+	if err := tt.Click("负面提示词"); err != nil {
+		t.Fatal(err)
+	}
+	if tt.HasText("不想出现") || !tt.HasText("负面提示词（已填）") {
+		t.Errorf("closed toggle must show filled state; texts %q", tt.Texts())
+	}
+}
+
+func TestViewIdleFrameFollowsAspect(t *testing.T) {
+	a := newApp()
+	tt := ui.NewTester(a.view, 1280, 800)
+	if err := tt.Click("尺寸 9:16"); err != nil {
+		t.Fatal(err)
+	}
+	if !tt.HasText("640 × 1152") {
+		t.Errorf("idle frame label not updated; texts %q", tt.Texts())
 	}
 }
 
