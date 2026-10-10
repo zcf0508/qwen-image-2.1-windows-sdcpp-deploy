@@ -125,14 +125,14 @@ func (a *app) view(c *ui.Context) {
 // ------------------------------------------------------------ 通用小部件
 
 // press 按下时下沉 1 像素。MyGo 没有缩放变换，用位移代替缩小。
-func press(b *ui.Element) {
+func press(b ui.Element) {
 	if b.Pressed() {
 		b.Top(1)
 	}
 }
 
 // fadeIn 元素出现时从透明淡入；换了 Key 的元素会重新淡入一次。
-func fadeIn(c *ui.Context, e *ui.Element) *ui.Element {
+func fadeIn(c *ui.Context, e ui.Element) ui.Element {
 	mounted := ui.Local(e, "mounted", func() bool { return false })
 	target := float32(0)
 	if *mounted {
@@ -145,7 +145,7 @@ func fadeIn(c *ui.Context, e *ui.Element) *ui.Element {
 }
 
 // button 次要按钮：控件底色，悬停抬亮一级。
-func button(c *ui.Context, ic *ui.SVG, label string, active, disabled bool) *ui.Element {
+func button(c *ui.Context, ic *ui.SVG, label string, active, disabled bool) ui.Element {
 	b := ui.ButtonBase(c).Gap(6).Padding(6, 12).Radius(radiusM).Background(colControl).
 		TextColor(colText2).Disabled(disabled)
 	switch {
@@ -169,7 +169,7 @@ func button(c *ui.Context, ic *ui.SVG, label string, active, disabled bool) *ui.
 }
 
 // iconButton 只有图标的方形按钮，名字给提示框和读屏。
-func iconButton(c *ui.Context, ic *ui.SVG, label string, active bool) *ui.Element {
+func iconButton(c *ui.Context, ic *ui.SVG, label string, active bool) ui.Element {
 	b := ui.ButtonBase(c).Size(32, 32).Radius(radiusM).Label(label).Tooltip(label).TextColor(colText2)
 	switch {
 	case active:
@@ -247,6 +247,8 @@ func (a *app) modeSwitch(c *ui.Context) {
 			})
 		}
 	})
+	// v0.3 起要先查询 Changed 才会把点击写入绑定的 idx
+	_ = seg.Track.Changed()
 	if idx == 1 {
 		a.mode = "edit"
 	} else {
@@ -448,7 +450,7 @@ func frameSize(aspect, maxW, maxH float32) (float32, float32) {
 
 // idlePanel 还没有图：按当前画幅画一个虚线画框，改画幅时它跟着变。
 func (a *app) idlePanel(c *ui.Context) {
-	panel := ui.Column(c).Key("idle").Fill().Center().Gap(12).Padding(24)
+	panel := ui.Column(c.Key("idle")).Fill().Center().Gap(12).Padding(24)
 	fadeIn(c, panel).Children(func() {
 		fw, fh := frameSize(a.currentAspect(), 320, 260)
 		ui.Box(c).Size(fw, fh).Center().Radius(radiusS).Border(1, colLineHi).BorderStyle(ui.BorderDashed).
@@ -472,7 +474,7 @@ func (a *app) generatingPanel(c *ui.Context) {
 	if a.genEstimate > 0 {
 		progress = float32(min(elapsed/a.genEstimate, 0.95))
 	}
-	panel := ui.Column(c).Key("generating").Fill().Center().Gap(14).Padding(24)
+	panel := ui.Column(c.Key("generating")).Fill().Center().Gap(14).Padding(24)
 	fadeIn(c, panel).Children(func() {
 		fw, fh := frameSize(a.genAspect, 320, 260)
 		ui.Box(c).Size(fw, fh).Center().Radius(radiusS).Clip().Background(colCard).Border(1, colLine).
@@ -504,7 +506,7 @@ func (a *app) generatingPanel(c *ui.Context) {
 
 // previewPanel 结果铺满画布，操作在右上角，文件名与耗时在左下角。
 func (a *app) previewPanel(c *ui.Context) {
-	panel := ui.Box(c).Key("preview:" + a.resultPath).Fill().Padding(16)
+	panel := ui.Box(c.Key("preview:" + a.resultPath)).Fill().Padding(16)
 	fadeIn(c, panel).Children(func() {
 		ui.Image(c, a.preview).Fill().Fit(ui.Contain)
 		ui.Row(c).Absolute().Top(12).Right(12).Gap(2).Padding(3).Radius(radiusM+3).
@@ -690,7 +692,7 @@ func (a *app) refDropzone(c *ui.Context) {
 // refTile 一张参考图的缩略图，返回本帧被点中的动作。
 func (a *app) refTile(c *ui.Context, i int, path string) (action func()) {
 	selected := i == a.refSelected
-	tile := ui.Box(c).Key(path).Size(68, 68).Shrink(0).Radius(radiusM).Clip().Cursor(ui.CursorPointer).
+	tile := ui.Box(c.Key(path)).Size(68, 68).Shrink(0).Radius(radiusM).Clip().Cursor(ui.CursorPointer).
 		Label(fmt.Sprintf("参考图 %d", i+1)).Tooltip(filepath.Base(path)).Background(colControl)
 	if selected {
 		tile.Border(1.5, colText2)
@@ -728,7 +730,7 @@ func (a *app) refTile(c *ui.Context, i int, path string) (action func()) {
 	return action
 }
 
-func tinyButton(c *ui.Context, ic *ui.SVG, label string) *ui.Element {
+func tinyButton(c *ui.Context, ic *ui.SVG, label string) ui.Element {
 	b := ui.ButtonBase(c).Size(20, 20).Radius(radiusS).Label(label).Tooltip(label).TextColor(colText2)
 	if b.Hovered() {
 		b.Background(colHover).TextColor(colText)

@@ -19,8 +19,8 @@ func TestParseGenerationParameters(t *testing.T) {
 	}
 
 	cases := []struct {
-		name                        string
-		w, h, steps, cfg, seed      string
+		name                   string
+		w, h, steps, cfg, seed string
 	}{
 		{"not a number", "abc", "1024", "40", "1.0", "-1"},
 		{"negative width", "-128", "1024", "40", "1.0", "-1"},

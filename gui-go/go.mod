@@ -5,7 +5,7 @@ go 1.27.1
 tool github.com/egoist/mygo/cmd/mygo
 
 require (
-	github.com/egoist/mygo v0.2.6
+	github.com/egoist/mygo v0.3.7
 	golang.org/x/sys v0.48.0
 )
 

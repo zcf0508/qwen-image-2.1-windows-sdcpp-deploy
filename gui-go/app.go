@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"encoding/base64"
@@ -36,18 +36,18 @@ type app struct {
 	prompt      string
 	negative    string
 
-	hd                    bool
-	width, height         string
-	steps, cfg, seed      string
-	sizeText              string
-	paramError            string
-	paramsValid           bool
+	hd               bool
+	width, height    string
+	steps, cfg, seed string
+	sizeText         string
+	paramError       string
+	paramsValid      bool
 
 	splitPos float32
 
 	busy, cancelPending, forceStopping bool
-	progressText                     string
-	progressActive                   bool
+	progressText                       string
+	progressActive                     bool
 
 	resultPath string
 	preview    *ui.Bitmap
@@ -718,4 +718,3 @@ func (a *app) onClose(e *mygo.CloseEvent) {
 		}()
 	}
 }
-
